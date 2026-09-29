@@ -54,6 +54,7 @@ fn serialize_migration(stmts: &[MigrationStatement<'_>], flavor: &str) -> Vec<St
                 "sqlite" => Serializer::sqlite(ms.schema()),
                 "postgresql" => Serializer::postgresql(ms.schema()),
                 "mysql" => Serializer::mysql(ms.schema()),
+                "mssql" => Serializer::mssql(ms.schema()),
                 _ => panic!("unknown flavor: {flavor}"),
             };
             serializer.serialize(ms.statement())
@@ -222,5 +223,26 @@ fn add_column_after_reordering_tables() {
     assert_eq!(
         sql,
         ["ALTER TABLE \"users\" ADD COLUMN \"name\" TEXT NOT NULL;"]
+    );
+}
+
+/// T-SQL spells a column addition `ADD <def>`: the `COLUMN` keyword the other
+/// dialects take is a syntax error there (error 156).
+#[test]
+fn add_column_not_null_mssql() {
+    let col = make_column(0, 1, "name", Type::Text);
+    let sql = add_column_sql(col, &Capability::MSSQL, "mssql");
+    assert_eq!(sql, "ALTER TABLE [users] ADD [name] NVARCHAR(MAX) NOT NULL;");
+}
+
+#[test]
+fn add_column_auto_increment_mssql() {
+    let mut col = make_column(0, 1, "seq", Type::Integer(8));
+    col.auto_increment = true;
+    let sql = add_column_sql(col, &Capability::MSSQL, "mssql");
+    assert!(sql.contains("IDENTITY(1,1)"), "got: {sql}");
+    assert!(
+        sql.starts_with("ALTER TABLE [users] ADD [seq]"),
+        "got: {sql}"
     );
 }

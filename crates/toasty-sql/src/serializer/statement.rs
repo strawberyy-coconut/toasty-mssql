@@ -110,8 +110,12 @@ impl ToSql for &stmt::AddColumn {
         // Create new expression scope to serialize the statement
         let mut f = f.scope(table);
 
+        // T-SQL spells a column addition `ADD <def>`; the `COLUMN` keyword is a
+        // syntax error there. (`DROP COLUMN` still takes it — see `DropColumn`.)
+        let column_keyword = if f.serializer.is_mssql() { "" } else { "COLUMN " };
+
         fmt!(
-            &mut f, "ALTER TABLE " table_name " ADD COLUMN " self.column
+            &mut f, "ALTER TABLE " table_name " ADD " column_keyword self.column
         );
     }
 }
