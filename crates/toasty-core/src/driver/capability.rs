@@ -524,6 +524,13 @@ pub enum SqlPlaceholder {
 
     /// Numbered `$1`, `$2`, ... placeholders.
     DollarNumber,
+
+    /// Named `@p1`, `@p2`, ... placeholders, as `sp_executesql` expects.
+    ///
+    /// T-SQL has no positional placeholder: a statement sent through
+    /// `sp_executesql` declares each parameter by name, so the bind layer
+    /// rewrites occurrence-order markers to these names.
+    AtPNumber,
 }
 
 impl Capability {
@@ -903,6 +910,158 @@ impl Capability {
         ..Self::MYSQL
     };
 
+    /// SQL Server (T-SQL) capabilities.
+    ///
+    /// Every field is spelled out rather than derived from [`MYSQL`](Self::MYSQL).
+    /// Inheriting the nearest SQL driver's value would answer for SQL Server on
+    /// any flag added upstream later — a claim this driver never made — so
+    /// listing them all makes a new upstream field a compile error here rather
+    /// than a MySQL value quietly reused for T-SQL.
+    pub const MSSQL: Self = Self {
+        driver_name: "SQL Server",
+
+        sql: Some(Dialect::Mssql),
+
+        // `sp_executesql` names each parameter, so occurrence-order markers are
+        // rewritten to `@p1`, `@p2`, … before the statement is sent.
+        sql_placeholder: Some(SqlPlaceholder::AtPNumber),
+
+        storage_types: StorageTypes::MSSQL,
+        schema_mutations: SchemaMutations::MSSQL,
+
+        // T-SQL does not accept a data-modifying CTE in the shape the planner
+        // emits, so a conditional UPDATE/DELETE is lowered to a
+        // read-modify-write transaction: `SELECT ... WITH (UPDLOCK, ROWLOCK)`
+        // then the write, which `select_for_update` below supports.
+        cte_with_update: false,
+
+        // `SELECT ... FOR UPDATE` is rendered as `WITH (UPDLOCK, ROWLOCK)`.
+        select_for_update: true,
+
+        // T-SQL has `OUTPUT INSERTED.<cols>` on both INSERT and UPDATE, which
+        // is what `RETURNING` lowers to. This also gives generated keys back
+        // without a second round trip.
+        returning_from_insert: true,
+        returning_from_update: true,
+
+        // `MERGE` covers all four shapes. Target matching is driven by the `ON`
+        // clause the planner puts in the statement, so primary-key and unique
+        // upserts are the same rendering. `HOLDLOCK` is required: without it the
+        // engine can release the range lock between the match test and the
+        // write, which is exactly the race an upsert exists to avoid.
+        upsert_primary_key: true,
+        upsert_unique: true,
+        upsert_branch_assignments: true,
+        upsert_targeted_ignore: true,
+
+        // `<>` is an ordinary predicate in T-SQL, including on a primary key.
+        primary_key_ne_predicate: true,
+
+        // `IDENTITY(1,1)`.
+        auto_increment: true,
+        max_auto_increment_integer_width: None,
+
+        // `sysname` is `nvarchar(128)`.
+        max_identifier_length: Some(128),
+
+        native_varchar: true,
+
+        // SQL Server has no native JSON column type before SQL Server 2025 and
+        // no named enum types. `Binary` storage is not wired up either.
+        native_json: false,
+        native_jsonb: false,
+        native_enum: false,
+        named_enum_types: false,
+
+        // SQL Server has native temporal and fixed-precision decimal types.
+        native_timestamp: true,
+        native_date: true,
+        native_time: true,
+        native_datetime: true,
+        native_decimal: true,
+        decimal_arbitrary_precision: false,
+        bigdecimal_implemented: false,
+
+        // No native network address types.
+        native_cidr: false,
+        native_inet: false,
+        native_macaddr: false,
+        native_macaddr8: false,
+
+        // SQL backends never use DynamoDB-style index key conditions.
+        index_or_predicate: true,
+
+        // `starts_with` stays in the AST for this driver to render, via the
+        // `binary_like_starts_with` mode: `Expr::StartsWith` becomes a `LIKE`
+        // pattern with `%`, `_` and `!` escaped, emitted with `ESCAPE '!'`.
+        // T-SQL has no dedicated prefix operator, so there is no GLOB and no `^@`.
+        native_starts_with: true,
+        glob_starts_with: false,
+        binary_like_starts_with: true,
+
+        // T-SQL has `LIKE`; `ILIKE` is PostgreSQL-only.
+        native_like: true,
+        native_ilike: false,
+
+        // The planner drives SQL databases through `QuerySql`; the key-value
+        // `Scan` operation is not implemented. SQL backends report
+        // `scan_supports_sort` as `true` by convention, which is moot while
+        // `scan` is off.
+        scan: false,
+        scan_supports_sort: true,
+
+        test_connection_pool: true,
+
+        // No SQLite-style lock-mode keyword; T-SQL locks through table hints.
+        transaction_lock_mode: false,
+
+        // A previous page is the same query with the `ORDER BY` reversed and a
+        // strict inequality on the cursor key, which T-SQL answers trivially.
+        backward_pagination: true,
+
+        // `ASC` places `NULL` before non-null values in T-SQL, so cursor
+        // predicates must use the same comparison placement the backend does.
+        sql_nulls_first_on_asc: true,
+
+        // `BIT` is a valid key/index column, so a `Bool` key needs no promotion
+        // to an integer column.
+        bool_key_type: true,
+
+        // A whole `Vec<scalar>` binds as one `NVARCHAR` parameter holding the
+        // JSON text, so the extract pass must keep the list intact. Reporting
+        // `false` instead expands the list into one argument per element, which
+        // renders as a T-SQL row value in a scalar position.
+        bind_list_param: true,
+
+        // T-SQL has no `expr = ANY(<array>)` form: `ANY` only accepts a
+        // subquery, so the planner must not produce one.
+        predicate_match_any: false,
+
+        // No native array type, so a `Vec<scalar>` column is JSON text, as on
+        // MySQL and SQLite. `OPENJSON` supplies the element enumeration, which
+        // is enough for membership, length and append — but a JSON array has no
+        // in-place removal, so the three removal flags stay off.
+        native_array: false,
+        vec_scalar: true,
+        unique_list_index: false,
+
+        // A `#[document]` field is JSON text too, read back with `JSON_VALUE`
+        // and `JSON_QUERY`. SQL Server has no index on a JSON path — one has to
+        // go through a computed column — so path filters scan, but that is a
+        // property of the queries rather than of this flag.
+        document_collections: true,
+
+        // A JSON array has no set operator in T-SQL. Reporting this makes the
+        // engine rewrite `Intersects`/`IsSuperset` with a concrete rhs into one
+        // membership test per element, which is the `OPENJSON` form this driver
+        // does render.
+        native_array_set_predicates: false,
+
+        vec_remove: false,
+        vec_pop: false,
+        vec_remove_at: false,
+    };
+
     /// Turso capabilities.
     ///
     /// Identical to [`SQLITE`](Self::SQLITE) at the flag level. The driver
@@ -1144,6 +1303,57 @@ impl StorageTypes {
         max_unsigned_integer: None,
     };
 
+    /// SQL Server storage types.
+    ///
+    /// `db::Type` has no `NVarChar` variant, so `VarChar(n)` is rendered as
+    /// `NVARCHAR(n)`. `NVARCHAR` is bounded and indexable, unlike
+    /// `NVARCHAR(MAX)`, which is why the defaults below are bounded rather than
+    /// `Text`.
+    pub const MSSQL: StorageTypes = StorageTypes {
+        // `NVARCHAR(4000)` — the largest non-`MAX` `NVARCHAR`. Bounded so that
+        // indexed and unique string columns are indexable at all; SQL Server
+        // cannot index `NVARCHAR(MAX)`.
+        default_string_type: db::Type::VarChar(4000),
+
+        // The maximum length an explicit varchar type may ask for.
+        varchar: Some(4000),
+
+        // SQL Server has a native 16-byte GUID type.
+        default_uuid_type: db::Type::Uuid,
+
+        // Rendered as `VARBINARY(MAX)`.
+        default_bytes_type: db::Type::Blob,
+
+        // SQL Server's `DECIMAL` requires an explicit precision and scale,
+        // which the schema does not always carry. Store the untyped default as
+        // text, as the MySQL driver does.
+        default_decimal_type: db::Type::Text,
+        default_bigdecimal_type: db::Type::Text,
+
+        // `DATETIME2(6)` — microsecond precision, and unlike `TIMESTAMP`
+        // (rowversion in T-SQL) it is a real date/time type.
+        default_timestamp_type: db::Type::DateTime(6),
+
+        // No native timezone-aware type is wired up yet, so a `Zoned` value is
+        // stored as text, as the MySQL driver does.
+        default_zoned_type: db::Type::Text,
+
+        default_date_type: db::Type::Date,
+        default_time_type: db::Type::Time(6),
+        default_datetime_type: db::Type::DateTime(6),
+
+        // SQL Server has no native network address types; bounded text keeps
+        // indexes compact while fitting IPv6 prefixes and EUI-64.
+        default_cidr_type: db::Type::VarChar(43),
+        default_inet_type: db::Type::VarChar(43),
+        default_macaddr_type: db::Type::VarChar(17),
+        default_macaddr8_type: db::Type::VarChar(23),
+
+        // SQL Server's integer types are all signed, so `u64` is capped at
+        // `i64::MAX` rather than silently switching to `DECIMAL`.
+        max_unsigned_integer: Some(i64::MAX as u64),
+    };
+
     /// DynamoDB storage types.
     pub const DYNAMODB: StorageTypes = StorageTypes {
         default_string_type: db::Type::Text,
@@ -1194,6 +1404,14 @@ impl SchemaMutations {
     /// MySQL schema mutation capabilities. Supports altering column types and
     /// atomically changing multiple column properties in a single statement.
     pub const MYSQL: Self = Self {
+        alter_column_type: true,
+        alter_column_properties_atomic: true,
+    };
+
+    /// SQL Server schema mutation capabilities. `ALTER TABLE ... ALTER COLUMN`
+    /// changes a column's type and nullability in one statement; a rename goes
+    /// through `sp_rename`.
+    pub const MSSQL: Self = Self {
         alter_column_type: true,
         alter_column_properties_atomic: true,
     };

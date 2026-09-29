@@ -34,5 +34,6 @@ fn write_sql_placeholder(
         SqlPlaceholder::QuestionMark => dst.write_str("?"),
         SqlPlaceholder::NumberedQuestionMark => write!(dst, "?{index}"),
         SqlPlaceholder::DollarNumber => write!(dst, "${index}"),
+        SqlPlaceholder::AtPNumber => write!(dst, "@p{index}"),
     }
 }

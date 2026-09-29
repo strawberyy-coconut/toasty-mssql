@@ -33,6 +33,7 @@ impl Connect {
     /// | `postgresql` / `postgres` | PostgreSQL | `postgresql` |
     /// | `mysql` | MySQL | `mysql` |
     /// | `mariadb` | MariaDB | `mariadb` |
+    /// | `mssql` / `sqlserver` | SQL Server | `mssql` |
     /// | `dynamodb` | DynamoDB | `dynamodb` |
     /// | `turso` | Turso | `turso` |
     ///
@@ -46,6 +47,7 @@ impl Connect {
                 feature = "dynamodb",
                 feature = "mysql",
                 feature = "mariadb",
+                feature = "mssql",
                 feature = "postgresql",
                 feature = "sqlite",
                 feature = "turso"
@@ -98,6 +100,15 @@ impl Connect {
             "postgresql" | "postgres" => {
                 return Err(toasty_core::Error::unsupported_feature(
                     "`postgresql` feature not enabled",
+                ));
+            }
+
+            #[cfg(feature = "mssql")]
+            "mssql" | "sqlserver" => Box::new(toasty_driver_mssql::Mssql::from_url(url.as_str())?),
+            #[cfg(not(feature = "mssql"))]
+            "mssql" | "sqlserver" => {
+                return Err(toasty_core::Error::unsupported_feature(
+                    "`mssql` feature not enabled",
                 ));
             }
 

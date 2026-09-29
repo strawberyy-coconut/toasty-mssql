@@ -91,6 +91,26 @@ struct Formatter<'a> {
     /// the params vec to match placeholder occurrence order. Borrowed so a
     /// scoped child formatter writes through to the root's vec.
     arg_positions: &'a mut Vec<usize>,
+
+    /// Set while rendering the body of a query that asked for a row lock, so
+    /// its `FROM` clause can carry the T-SQL table hint. T-SQL has no trailing
+    /// `FOR UPDATE`, so the lock has to be emitted on the source instead, and
+    /// it is consumed by the first source rendered. Ignored by other dialects.
+    row_lock: bool,
+
+    /// Set while rendering a `MERGE`. The statement has a source relation whose
+    /// column names match the table being written, so columns of the written
+    /// table are qualified to stay unambiguous. Only SQL Server reads this.
+    merge: bool,
+
+    /// Set while rendering an `OUTPUT` clause, so column references become
+    /// `INSERTED.[col]` / `DELETED.[col]`. Only SQL Server reads this.
+    output: Option<&'static str>,
+
+    /// For an INSERT, one flag per target column marking whether the column is
+    /// actually written. SQL Server drops generated (`IDENTITY`) columns: it
+    /// rejects `DEFAULT` or `NULL` as an explicit identity value.
+    insert_columns: Option<Vec<bool>>,
 }
 
 impl<'a> Formatter<'a> {
@@ -111,6 +131,10 @@ impl<'a> Formatter<'a> {
             in_insert: self.in_insert,
             assignment_table: self.assignment_table,
             arg_positions: &mut *self.arg_positions,
+            row_lock: self.row_lock,
+            merge: self.merge,
+            output: self.output,
+            insert_columns: self.insert_columns.clone(),
         }
     }
 }
@@ -151,6 +175,10 @@ impl<'a> Serializer<'a> {
                 in_insert: false,
                 assignment_table: None,
                 arg_positions: &mut arg_positions,
+                row_lock: false,
+                merge: false,
+                output: None,
+                insert_columns: None,
             };
 
             stmt.to_sql(&mut fmt);
@@ -178,6 +206,10 @@ impl<'a> Serializer<'a> {
                 in_insert: false,
                 assignment_table: None,
                 arg_positions: &mut arg_positions,
+                row_lock: false,
+                merge: false,
+                output: None,
+                insert_columns: None,
             };
 
             match op {
@@ -191,6 +223,22 @@ impl<'a> Serializer<'a> {
                 ),
                 Transaction::Commit => fmt!(&mut f, "COMMIT"),
                 Transaction::Rollback => fmt!(&mut f, "ROLLBACK"),
+                Transaction::Savepoint(name) if matches!(f.serializer.dialect, Dialect::Mssql) => {
+                    fmt!(&mut f, "SAVE TRANSACTION " Ident(name))
+                }
+                Transaction::ReleaseSavepoint(name)
+                    if matches!(f.serializer.dialect, Dialect::Mssql) =>
+                {
+                    // T-SQL has no `RELEASE SAVEPOINT`: a savepoint is discarded
+                    // when the transaction commits. The driver treats this as a
+                    // no-op, so the placeholder keeps the statement well formed.
+                    fmt!(&mut f, "SELECT 1 WHERE 1 = 0 /* RELEASE SAVEPOINT " Ident(name) " */")
+                }
+                Transaction::RollbackToSavepoint(name)
+                    if matches!(f.serializer.dialect, Dialect::Mssql) =>
+                {
+                    fmt!(&mut f, "ROLLBACK TRANSACTION " Ident(name))
+                }
                 Transaction::Savepoint(name) => {
                     fmt!(&mut f, "SAVEPOINT " Ident(name))
                 }
@@ -251,6 +299,19 @@ impl<'a> Serializer<'a> {
                 }
                 sql
             }
+            // SQL Server has no SQLite-style lock-mode keyword; drivers reject
+            // non-`Default` `mode` before reaching the serializer. The isolation
+            // level is set for the next transaction, then the transaction starts.
+            Dialect::Mssql => {
+                let mut sql = String::new();
+                if let Some(level) = isolation {
+                    sql.push_str("SET TRANSACTION ISOLATION LEVEL ");
+                    sql.push_str(isolation_level_str(level));
+                    sql.push_str("; ");
+                }
+                sql.push_str("BEGIN TRANSACTION");
+                sql
+            }
             // SQLite has no per-transaction isolation level or read-only
             // keyword; the lock-acquisition mode is the only knob. `Default`
             // emits whatever the serializer was configured with at
@@ -283,4 +344,70 @@ impl<'a> Serializer<'a> {
         let column = self.schema.column(id.into());
         Ident(&column.name)
     }
+}
+
+// ---------------------------------------------------------------------------
+// SQL Server carried function calls
+//
+// Toasty's expression AST has no variant for "call a function by name", and it
+// is a closed enum, so a SQL Server driver cannot add one. A call is therefore
+// carried in the node Toasty uses for `#[document]` paths,
+// `stmt::FuncJsonExtract`, which holds both an arbitrary operand expression
+// (`base`) and a `Vec<String>` (`path`):
+//
+//     FuncJsonExtract {
+//         base: <the column expression>,
+//         path: ["!ISJSON", "{base}", "ARRAY"],   // name, then the arguments
+//         ty:   <the result type>,
+//     }
+//
+// The markers below distinguish a call from a real document path extraction;
+// the SQL Server driver's model-facing function traits use them to encode a
+// call, and the expression renderer decodes it here. They live beside the
+// renderer so the wire format has a single definition.
+
+/// Marks a `path` as a carried call rather than a document path extraction.
+#[doc(hidden)]
+pub const MSSQL_FUNC_MARKER: char = '!';
+
+/// Introduces a carried call that is a method on the operand: `col.STArea()`.
+#[doc(hidden)]
+pub const MSSQL_FUNC_METHOD: char = '.';
+
+/// Stands where the operand goes in an argument list.
+///
+/// Not every T-SQL function takes its subject first: `DATEPART(day, col)` and
+/// `CHARINDEX(N'needle', col)` both take it last, so the argument list carries
+/// the position rather than assuming it.
+#[doc(hidden)]
+pub const MSSQL_FUNC_OPERAND: &str = "{base}";
+
+/// A decoded SQL Server carried function call.
+pub(crate) struct MssqlFuncCall<'a> {
+    /// The function or method name, with any prefix already stripped.
+    pub(crate) name: &'a str,
+    /// Already-escaped T-SQL text for each argument.
+    pub(crate) args: &'a [String],
+    /// Whether the operand is the receiver (`col.STArea()`) rather than an
+    /// argument (`ISJSON(col)`).
+    pub(crate) method: bool,
+}
+
+/// Returns the call encoded in `path`, or `None` when this is a real document
+/// path extraction.
+pub(crate) fn mssql_decode_func_call(path: &[String]) -> Option<MssqlFuncCall<'_>> {
+    let (head, args) = path.split_first()?;
+    let name = head.strip_prefix(MSSQL_FUNC_MARKER)?;
+
+    let (method, name) = match name.strip_prefix(MSSQL_FUNC_METHOD) {
+        Some(name) => (true, name),
+        None => (false, name),
+    };
+
+    Some(MssqlFuncCall { name, args, method })
+}
+
+/// Whether `arg` is the placeholder for the operand rather than a literal.
+pub(crate) fn mssql_func_is_operand(arg: &str) -> bool {
+    arg == MSSQL_FUNC_OPERAND
 }

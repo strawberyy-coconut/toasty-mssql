@@ -193,6 +193,8 @@ pub async fn query_infers_storage_values(t: &mut Test) -> Result<()> {
         toasty::SqlPlaceholder::DollarNumber => Value::Uuid(uuid),
         toasty::SqlPlaceholder::QuestionMark => Value::String(uuid.to_string()),
         toasty::SqlPlaceholder::NumberedQuestionMark => Value::Bytes(uuid.as_bytes().to_vec()),
+        // SQL Server has a native GUID type, so the value round-trips as a UUID.
+        toasty::SqlPlaceholder::AtPNumber => Value::Uuid(uuid),
     };
     let expected = vec![
         expected_bool,
@@ -547,6 +549,7 @@ fn render_placeholder(placeholder: toasty::SqlPlaceholder, index: usize) -> Stri
         toasty::SqlPlaceholder::QuestionMark => "?".to_string(),
         toasty::SqlPlaceholder::NumberedQuestionMark => format!("?{index}"),
         toasty::SqlPlaceholder::DollarNumber => format!("${index}"),
+        toasty::SqlPlaceholder::AtPNumber => format!("@p{index}"),
     }
 }
 

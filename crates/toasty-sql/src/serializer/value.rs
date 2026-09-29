@@ -28,6 +28,12 @@ impl ToSql for &stmt::Value {
             // DML values are already extracted as Expr::Arg placeholders before
             // reaching the serializer.
             String(s) => {
+                // SQL Server spells a Unicode string literal with an `N` prefix;
+                // without it the literal is interpreted in the database's
+                // non-Unicode code page and non-ASCII characters can be lost.
+                if f.serializer.is_mssql() {
+                    f.dst.push('N');
+                }
                 f.dst.push('\'');
                 // Escape single quotes by doubling them.
                 for ch in s.chars() {
@@ -43,7 +49,12 @@ impl ToSql for &stmt::Value {
                 write!(f.dst, "{n}").unwrap();
             }
             Bool(b) => {
-                f.dst.push_str(if *b { "TRUE" } else { "FALSE" });
+                // T-SQL has no boolean literal type; `BIT` is written `1`/`0`.
+                if f.serializer.is_mssql() {
+                    f.dst.push_str(if *b { "1" } else { "0" });
+                } else {
+                    f.dst.push_str(if *b { "TRUE" } else { "FALSE" });
+                }
             }
             _ => todo!("inline SQL literal for value: {self:?}"),
         }

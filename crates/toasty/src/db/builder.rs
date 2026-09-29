@@ -226,8 +226,8 @@ impl Builder {
     /// Open a database connection using a URL string.
     ///
     /// The URL scheme selects the driver (`sqlite://`, `postgresql://`,
-    /// `mysql://`, `dynamodb://`). The corresponding feature flag must be
-    /// enabled.
+    /// `mysql://`, `mssql://`, `dynamodb://`). The corresponding feature flag
+    /// must be enabled.
     ///
     /// # Errors
     ///

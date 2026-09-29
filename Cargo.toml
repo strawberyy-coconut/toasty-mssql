@@ -9,6 +9,8 @@ members = [
 
     # Driver implementations
     "crates/toasty-driver-dynamodb",
+    "crates/toasty-driver-mssql",
+    "crates/toasty-driver-mssql/ext",
     "crates/toasty-driver-mysql",
     "crates/toasty-driver-postgresql",
     "crates/toasty-driver-sqlite",
@@ -81,6 +83,7 @@ toasty-macros = { version = "0.11.0", path = "crates/toasty-macros" }
 toasty-sql = { version = "0.11.0", path = "crates/toasty-sql" }
 # Driver implementations
 toasty-driver-dynamodb = { version = "0.11.0", path = "crates/toasty-driver-dynamodb" }
+toasty-driver-mssql = { version = "0.11.0", path = "crates/toasty-driver-mssql", default-features = false }
 toasty-driver-mysql = { version = "0.11.0", path = "crates/toasty-driver-mysql", default-features = false }
 toasty-driver-postgresql = { version = "0.11.0", path = "crates/toasty-driver-postgresql" }
 toasty-driver-sqlite = { version = "0.11.0", path = "crates/toasty-driver-sqlite" }

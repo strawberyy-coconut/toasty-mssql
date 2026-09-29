@@ -1,0 +1,60 @@
+[package]
+name = "toasty-driver-mssql-ext"
+version = "0.11.0"
+description = "Model-facing SQL Server extensions for the Toasty MSSQL driver"
+authors.workspace = true
+edition.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+categories.workspace = true
+# This is a companion to `toasty-driver-mssql`, not a driver of its own. Neither
+# the driver nor `toasty` depends on it, so nothing in the built-in dependency
+# graph changes when it is added; a user who wants SQL Server's built-in
+# functions, `geometry`/`geography` columns, or `datetimeoffset` adds it
+# explicitly. It cannot be published ahead of the driver it extends.
+publish = false
+
+[features]
+default = []
+
+# Internal: the trait modules extend `toasty::stmt::Path`, so they need the
+# `toasty` crate.
+toasty = ["dep:toasty"]
+
+# Model-facing wrappers for SQL Server's `geometry` and `geography` columns, and
+# the methods on them. `geo-types` is what the shapes are expressed in.
+spatial = ["toasty", "dep:geo-types"]
+
+# A model-facing wrapper for SQL Server's `datetimeoffset` column type, which
+# carries an instant together with the offset it is displayed in.
+datetimeoffset = ["toasty", "dep:jiff"]
+
+# SQL Server's built-in functions, one feature per category of Microsoft's own
+# reference (https://learn.microsoft.com/en-us/sql/t-sql/functions/functions).
+funcs-json = ["toasty"]
+funcs-string = ["toasty"]
+funcs-math = ["toasty"]
+# The one category that needs more from `toasty` than `dep:toasty`: the methods
+# are implemented for the `jiff` temporal types, which `toasty` re-exports only
+# under its own `jiff` feature.
+funcs-date = ["toasty", "toasty/jiff"]
+
+# All of them. Spatial methods are not included: they come with `spatial`.
+funcs = ["funcs-json", "funcs-string", "funcs-math", "funcs-date"]
+
+[dependencies]
+geo-types = { version = "0.7", optional = true }
+jiff = { workspace = true, optional = true }
+toasty = { version = "0.11.0", path = "../../toasty", default-features = false, optional = true }
+toasty-core = { workspace = true, features = ["bigdecimal", "jiff", "net", "rust_decimal"] }
+# The T-SQL scalar type name the driver and this crate share.
+toasty-driver-mssql = { workspace = true }
+# The wire format that carries a function call through `FuncJsonExtract` lives
+# beside the renderer that decodes it.
+toasty-sql = { workspace = true }
+
+[lints]
+workspace = true

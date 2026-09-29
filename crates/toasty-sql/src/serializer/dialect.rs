@@ -59,6 +59,20 @@ impl<'a> Serializer<'a> {
         }
     }
 
+    /// Creates a serializer that emits SQL Server (T-SQL) SQL.
+    pub fn mssql(schema: &'a db::Schema) -> Self {
+        Serializer {
+            schema,
+            dialect: Dialect::Mssql,
+            sqlite_default_begin: "BEGIN",
+        }
+    }
+
+    /// Returns `true` if this serializer targets SQL Server.
+    pub fn is_mssql(&self) -> bool {
+        matches!(self.dialect, Dialect::Mssql)
+    }
+
     /// Returns `true` for both MySQL and MariaDB.
     ///
     /// Most rendering is shared; the places that are not match on
@@ -74,5 +88,6 @@ pub(super) fn sql_placeholder(dialect: Dialect) -> SqlPlaceholder {
         Dialect::Postgresql => SqlPlaceholder::DollarNumber,
         Dialect::Sqlite => SqlPlaceholder::NumberedQuestionMark,
         Dialect::Mysql | Dialect::MariaDb => SqlPlaceholder::QuestionMark,
+        Dialect::Mssql => SqlPlaceholder::AtPNumber,
     }
 }

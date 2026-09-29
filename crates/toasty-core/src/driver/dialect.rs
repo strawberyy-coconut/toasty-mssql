@@ -8,6 +8,11 @@
 /// Dialect-compatible engines share a variant: Turso reports
 /// [`Sqlite`](Self::Sqlite) because it accepts SQLite's SQL.
 ///
+/// [`Mssql`](Self::Mssql) is SQL Server's T-SQL. It is the dialect that differs
+/// most from the others: identifiers are `[bracket]` quoted, bind parameters are
+/// named `@pN`, `LIMIT` is spelled `OFFSET … FETCH NEXT`, and `RETURNING`
+/// becomes an `OUTPUT INSERTED`/`DELETED` clause.
+///
 /// # Examples
 ///
 /// ```
@@ -29,4 +34,7 @@ pub enum Dialect {
 
     /// MariaDB.
     MariaDb,
+
+    /// Microsoft SQL Server, and engines that accept T-SQL.
+    Mssql,
 }

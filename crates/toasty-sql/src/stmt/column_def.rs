@@ -24,18 +24,20 @@ pub struct ColumnDef {
 impl ColumnDef {
     pub(crate) fn from_schema(
         column: &Column,
-        _storage_types: &driver::StorageTypes,
+        storage_types: &driver::StorageTypes,
         capability: &Capability,
     ) -> Self {
-        // For SQLite enum columns: store as TEXT with a CHECK constraint instead
-        // of db::Type::Enum. The CHECK constraint restricts values to the
-        // declared variants.
+        // For backends without a native enum type, store the variant name in
+        // the backend's default string type with a CHECK constraint instead of
+        // `db::Type::Enum`. The CHECK constraint restricts values to the
+        // declared variants. SQLite's default string type is `TEXT`; SQL
+        // Server's is a bounded `NVARCHAR`, which keeps the column indexable.
         if let db::Type::Enum(type_enum) = &column.storage_ty
             && !capability.native_enum
         {
             return Self {
                 name: column.name.clone(),
-                ty: db::Type::Text,
+                ty: storage_types.default_string_type.clone(),
                 not_null: !column.nullable,
                 auto_increment: column.auto_increment,
                 check: Some(CheckConstraint {

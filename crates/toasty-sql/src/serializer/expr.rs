@@ -4,6 +4,13 @@ use super::{ColumnAlias, Comma, Delimited, Ident, ToSql};
 
 use crate::{serializer::Dialect, stmt};
 
+/// The collation that makes a comparison case-sensitive on SQL Server.
+///
+/// SQL Server's default collation is case-insensitive, which is not what
+/// Toasty's `starts_with` and collection-membership predicates promise, so the
+/// comparisons that need it opt in to a binary collation.
+const CASE_SENSITIVE_COLLATION: &str = "Latin1_General_BIN2";
+
 impl ToSql for &stmt::Expr {
     fn to_sql(self, f: &mut super::Formatter<'_>) {
         match self {
@@ -26,15 +33,23 @@ impl ToSql for &stmt::Expr {
             }
             stmt::Expr::Func(stmt::ExprFunc::Count(func)) => match (&func.arg, &func.filter) {
                 (None, None) => fmt!(f, "COUNT(*)"),
-                // Mysql does not support filters, so translate it to an expression
-                (None, Some(expr)) if f.serializer.is_mysql() => {
+                // MySQL does not support filters, and neither does T-SQL, so
+                // translate the filter into a conditional aggregate.
+                (None, Some(expr)) if f.serializer.is_mysql() || f.serializer.is_mssql() => {
                     fmt!(f, "COUNT(CASE WHEN " expr " THEN 1 END)")
                 }
                 (None, Some(expr)) => fmt!(f, "COUNT(*) FILTER (WHERE " expr ")"),
                 _ => todo!("func={func:#?}"),
             },
             stmt::Expr::Func(stmt::ExprFunc::LastInsertId(_)) => {
-                fmt!(f, "LAST_INSERT_ID()")
+                if f.serializer.is_mssql() {
+                    // `@@IDENTITY` crosses triggers; `SCOPE_IDENTITY` is the
+                    // current scope's last identity, which is what an insert
+                    // returning its generated key wants.
+                    fmt!(f, "SCOPE_IDENTITY()")
+                } else {
+                    fmt!(f, "LAST_INSERT_ID()")
+                }
             }
             stmt::Expr::Func(stmt::ExprFunc::JsonExtract(func)) => {
                 serialize_json_extract(f, func);
@@ -52,7 +67,13 @@ impl ToSql for &stmt::Expr {
                     table: *table,
                     index: *column,
                 };
-                fmt!(f, "excluded." f.serializer.column_name(column));
+                // SQL Server names the row an upsert proposes through the
+                // `MERGE` source relation rather than `excluded`.
+                if f.serializer.is_mssql() {
+                    fmt!(f, "src." f.serializer.column_name(column));
+                } else {
+                    fmt!(f, "excluded." f.serializer.column_name(column));
+                }
             }
             stmt::Expr::Incoming(_) => panic!("incoming row must be projected"),
             stmt::Expr::IsSuperset(e) => match f.serializer.dialect {
@@ -71,6 +92,13 @@ impl ToSql for &stmt::Expr {
                     ") AS r WHERE r.value NOT IN (SELECT l.value FROM json_each("
                     e.lhs.as_ref() ") AS l))"
                 ),
+                // T-SQL has no set operator over a JSON array. The capability
+                // reports `native_array_set_predicates: false`, so the engine
+                // rewrites this into one membership test per rhs element before
+                // the driver sees it.
+                Dialect::Mssql => unreachable!(
+                    "SQL Server has no native array set predicates; the engine must rewrite IsSuperset; expr={e:?}"
+                ),
             },
             stmt::Expr::Intersects(e) => match f.serializer.dialect {
                 Dialect::Postgresql => fmt!(f, e.lhs.as_ref() " && " e.rhs.as_ref()),
@@ -83,16 +111,37 @@ impl ToSql for &stmt::Expr {
                     ") AS r WHERE r.value IN (SELECT l.value FROM json_each("
                     e.lhs.as_ref() ") AS l))"
                 ),
+                // As with `IsSuperset`, the engine rewrites this because the
+                // capability reports no native set predicate.
+                Dialect::Mssql => unreachable!(
+                    "SQL Server has no native array set predicates; the engine must rewrite Intersects; expr={e:?}"
+                ),
             },
             stmt::Expr::Length(e) => match f.serializer.dialect {
                 Dialect::Postgresql => fmt!(f, "cardinality(" e.expr.as_ref() ")"),
                 Dialect::Mysql | Dialect::MariaDb => fmt!(f, "JSON_LENGTH(" e.expr.as_ref() ")"),
                 Dialect::Sqlite => fmt!(f, "json_array_length(" e.expr.as_ref() ")"),
+                // `OPENJSON` is the only way to enumerate a JSON array in T-SQL
+                // before SQL Server 2025; its row count is the element count.
+                Dialect::Mssql => fmt!(
+                    f,
+                    "(SELECT COUNT(*) FROM OPENJSON(" e.expr.as_ref() "))"
+                ),
             },
             stmt::Expr::Ident(name) => {
                 fmt!(f, Ident(name));
             }
             stmt::Expr::InList(expr) => {
+                // A composite key compares a row value, which T-SQL does not
+                // have, so `(a, b) IN ((x, y), (z, w))` has to be expanded into
+                // an `OR` of `AND`s.
+                if f.serializer.is_mssql()
+                    && let Some(fields) = row_fields(&expr.expr)
+                {
+                    serialize_mssql_row_in_list(f, fields, &expr.list);
+                    return;
+                }
+
                 fmt!(f, expr.expr " IN " expr.list);
             }
             stmt::Expr::AnyOp(expr) => match f.serializer.dialect {
@@ -129,11 +178,36 @@ impl ToSql for &stmt::Expr {
                 Dialect::Sqlite => {
                     unreachable!("AnyOp with non-Eq operator on SQLite: {expr:?}")
                 }
+                // SQL Server has no array type, and its `ANY` quantifier only
+                // accepts a subquery, so the collection is enumerated with
+                // `OPENJSON`. The elements are forced to a binary collation
+                // because membership must be case-sensitive while the server
+                // default collation is not.
+                Dialect::Mssql if matches!(expr.op, stmt::BinaryOp::Eq) => {
+                    fmt!(
+                        f,
+                        expr.lhs " IN (SELECT [value] COLLATE " CASE_SENSITIVE_COLLATION
+                        " FROM OPENJSON(" expr.rhs "))"
+                    );
+                }
+                Dialect::Mssql => {
+                    unreachable!("AnyOp with non-Eq operator on SQL Server: {expr:?}")
+                }
             },
             stmt::Expr::AllOp(expr) => {
                 fmt!(f, expr.lhs " " expr.op " ALL(" expr.rhs ")");
             }
             stmt::Expr::InSubquery(expr) => {
+                // A row value cannot be compared against a subquery in T-SQL
+                // either, so a composite key wraps the subquery in a derived
+                // table with positional column names.
+                if f.serializer.is_mssql()
+                    && let Some(fields) = row_fields(&expr.expr)
+                {
+                    serialize_mssql_row_in_subquery(f, fields, &expr.query, expr.negated);
+                    return;
+                }
+
                 let op = if expr.negated { " NOT IN (" } else { " IN (" };
                 fmt!(f, expr.expr op expr.query ")");
             }
@@ -184,6 +258,20 @@ impl ToSql for &stmt::Expr {
                     Dialect::Mysql | Dialect::MariaDb => {
                         fmt!(f, "BINARY " expr.expr " LIKE " expr.prefix " ESCAPE '!'");
                     }
+                    // SQL Server has no dedicated prefix operator. The planner
+                    // rewrote the prefix into a finished `LIKE` pattern with `%`,
+                    // `_` and `!` escaped and a trailing `%` appended, so this
+                    // only has to force a case-sensitive comparison with a
+                    // binary collation and name the escape character. The
+                    // operand is parenthesised because `COLLATE` binds to
+                    // whatever expression precedes it.
+                    Dialect::Mssql => {
+                        fmt!(
+                            f,
+                            "((" expr.expr ") COLLATE " CASE_SENSITIVE_COLLATION
+                            " LIKE " expr.prefix " ESCAPE '!')"
+                        );
+                    }
                 }
             }
             stmt::Expr::Not(expr) => {
@@ -219,7 +307,16 @@ impl ToSql for &stmt::Expr {
                     let column =
                         f.cx.resolve_expr_reference(expr_reference)
                             .as_column_unwrap();
-                    if matches!(f.serializer.dialect, Dialect::Postgresql)
+                    // Inside an `OUTPUT` clause a column names the affected side
+                    // of the write, not the merged table.
+                    if let Some(prefix) = f.output {
+                        fmt!(f, prefix "." Ident(&column.name))
+                    } else if f.merge {
+                        // A `MERGE`'s source relation shares its column names
+                        // with the written table, so the stored column is
+                        // qualified.
+                        fmt!(f, "target." Ident(&column.name))
+                    } else if matches!(f.serializer.dialect, Dialect::Postgresql)
                         && expr_column.nesting == 0
                         && f.assignment_table == Some(column.id.table)
                     {
@@ -251,7 +348,9 @@ impl ToSql for &stmt::Expr {
                 fmt!(f, placeholder);
             }
             stmt::Expr::Default => match f.serializer.dialect {
-                Dialect::Postgresql | Dialect::Mysql | Dialect::MariaDb => fmt!(f, "DEFAULT"),
+                Dialect::Postgresql | Dialect::Mysql | Dialect::MariaDb | Dialect::Mssql => {
+                    fmt!(f, "DEFAULT")
+                }
                 // SQLite does not support the DEFAULT keyword but NULL acts similarly.
                 Dialect::Sqlite => fmt!(f, "NULL"),
             },
@@ -298,6 +397,7 @@ fn serialize_json_extract(f: &mut super::Formatter<'_>, func: &stmt::FuncJsonExt
             );
         }
         Dialect::Mysql | Dialect::MariaDb => serialize_mysql_json_extract(f, func),
+        Dialect::Mssql => serialize_mssql_json_extract(f, func),
         Dialect::Postgresql => {
             // Descend with `->`, take the leaf as text with `->>`, then cast the
             // text to the leaf type so it compares against a bound parameter.
@@ -436,6 +536,216 @@ fn pg_json_cast(ty: &stmt::Type) -> Option<&'static str> {
         Type::MacAddr8 => "macaddr8",
         _ => return None,
     })
+}
+
+/// Renders a SQL Server document path read, or a carried scalar function call.
+///
+/// `JSON_VALUE` returns a scalar as `nvarchar(4000)` whatever it actually
+/// holds, so the leaf's own type is cast back on: a number has to compare as a
+/// number and a timestamp as a timestamp, not as the text that represents them.
+/// `JSON_QUERY` is the counterpart for a leaf that is itself an object or
+/// array, which `JSON_VALUE` would answer with `NULL`.
+///
+/// No collation is forced, deliberately: the suite requires a document string
+/// leaf to match with the *same* case sensitivity as a plain column, and
+/// `JSON_VALUE` inherits the input's collation, which already agrees with the
+/// server-default column comparisons.
+fn serialize_mssql_json_extract(f: &mut super::Formatter<'_>, func: &stmt::FuncJsonExtract) {
+    // A carried scalar function call lives in the same node as a document path
+    // read; the `!` marker is what separates them.
+    if let Some(call) = super::mssql_decode_func_call(&func.path) {
+        if call.method {
+            // A method hangs off the operand — `col.STArea()` — because that is
+            // the only form T-SQL offers for it.
+            func.base.as_ref().to_sql(f);
+            f.dst.push('.');
+            f.dst.push_str(call.name);
+            f.dst.push('(');
+        } else {
+            f.dst.push_str(call.name);
+            f.dst.push('(');
+        }
+
+        for (index, arg) in call.args.iter().enumerate() {
+            if index > 0 {
+                f.dst.push_str(", ");
+            }
+            if super::mssql_func_is_operand(arg) {
+                func.base.as_ref().to_sql(f);
+            } else {
+                f.dst.push_str(arg);
+            }
+        }
+
+        f.dst.push(')');
+        return;
+    }
+
+    let object = matches!(func.ty, stmt::Type::Object);
+    f.dst.push_str(if object {
+        "JSON_QUERY("
+    } else {
+        "CAST(JSON_VALUE("
+    });
+    func.base.as_ref().to_sql(f);
+    f.dst.push_str(", '$");
+    for key in &func.path {
+        // Keys come from Rust field names, so they need no quoting.
+        f.dst.push('.');
+        f.dst.push_str(key);
+    }
+    f.dst.push_str("')");
+
+    if object {
+        return;
+    }
+
+    f.dst.push_str(" AS ");
+    f.dst
+        .push_str(mssql_cast_type(&func.ty).unwrap_or("NVARCHAR(MAX)"));
+    f.dst.push(')');
+}
+
+/// The T-SQL `CAST(... AS <type>)` target for a scalar a document leaf can
+/// hold, mirroring the storage types the capability declares.
+fn mssql_cast_type(ty: &stmt::Type) -> Option<&'static str> {
+    use crate::stmt::Type;
+
+    Some(match ty {
+        Type::Bool => "BIT",
+        Type::I8 | Type::I16 => "SMALLINT",
+        Type::I32 => "INT",
+        Type::I64 => "BIGINT",
+        Type::U8 => "SMALLINT",
+        Type::U16 => "INT",
+        Type::U32 => "BIGINT",
+        Type::U64 => "DECIMAL(20, 0)",
+        Type::F32 => "REAL",
+        Type::F64 => "FLOAT",
+        Type::String => "NVARCHAR(MAX)",
+        Type::Uuid => "UNIQUEIDENTIFIER",
+        #[cfg(feature = "rust_decimal")]
+        Type::Decimal => "DECIMAL(38, 10)",
+        #[cfg(feature = "bigdecimal")]
+        Type::BigDecimal => "DECIMAL(38, 10)",
+        #[cfg(feature = "jiff")]
+        Type::Timestamp => "DATETIME2(6)",
+        #[cfg(feature = "jiff")]
+        Type::Date => "DATE",
+        #[cfg(feature = "jiff")]
+        Type::Time => "TIME(6)",
+        #[cfg(feature = "jiff")]
+        Type::DateTime => "DATETIME2(6)",
+        _ => return None,
+    })
+}
+
+/// The fields of a row value (`Expr::Record`), if `expr` is one.
+fn row_fields(expr: &stmt::Expr) -> Option<&[stmt::Expr]> {
+    match expr {
+        stmt::Expr::Record(record) => Some(&record.fields),
+        _ => None,
+    }
+}
+
+/// The positional alias T-SQL uses for the `index`th column of a derived table.
+fn mssql_column_alias(index: usize) -> String {
+    format!("column{}", index + 1)
+}
+
+/// Renders `(a, b) IN ((x, y), (z, w))` for SQL Server.
+///
+/// T-SQL has no row value constructor, so a composite `IN` list becomes the
+/// equivalent `OR` of `AND`s. `NULL` handling carries over unchanged: an
+/// unknown comparison stays unknown through `AND` and `OR`.
+fn serialize_mssql_row_in_list(
+    f: &mut super::Formatter<'_>,
+    fields: &[stmt::Expr],
+    list: &stmt::Expr,
+) {
+    let rows: Vec<&stmt::Expr> = match list {
+        stmt::Expr::List(list) => list.items.iter().collect(),
+        other => panic!("SQL Server requires a composite key IN list of tuples, found {other:?}"),
+    };
+
+    if rows.is_empty() {
+        // An empty list matches nothing, but T-SQL still needs a boolean
+        // expression wherever the planner put this one.
+        f.dst.push_str("(1 = 0)");
+        return;
+    }
+
+    f.dst.push('(');
+    for (index, row) in rows.iter().enumerate() {
+        if index > 0 {
+            f.dst.push_str(" OR ");
+        }
+
+        let Some(row) = row_fields(row) else {
+            panic!("SQL Server requires each element of a composite key IN list to be a tuple");
+        };
+        assert_eq!(
+            row.len(),
+            fields.len(),
+            "composite key tuples must have matching arity"
+        );
+
+        f.dst.push('(');
+        for (index, (lhs, rhs)) in fields.iter().zip(row).enumerate() {
+            if index > 0 {
+                f.dst.push_str(" AND ");
+            }
+            lhs.to_sql(f);
+            f.dst.push_str(" = ");
+            rhs.to_sql(f);
+        }
+        f.dst.push(')');
+    }
+    f.dst.push(')');
+}
+
+/// Renders `(a, b) IN (SELECT x, y FROM …)` for SQL Server.
+///
+/// A row value cannot be compared against a subquery either, so the subquery is
+/// wrapped in a derived table. The explicit column list gives it the positional
+/// `column1`, `column2` names the projection already aliases its select list
+/// with, which the correlation then compares against.
+fn serialize_mssql_row_in_subquery(
+    f: &mut super::Formatter<'_>,
+    fields: &[stmt::Expr],
+    query: &stmt::Query,
+    negated: bool,
+) {
+    // `depth` is bumped by every nested query, so sibling subqueries cannot
+    // collide and neither can two nested composite `IN`s.
+    let alias = format!("in_{}", f.depth);
+
+    if negated {
+        f.dst.push_str("NOT ");
+    }
+    f.dst.push_str("EXISTS (SELECT 1 FROM (");
+    query.to_sql(f);
+    f.dst.push_str(") AS [");
+    f.dst.push_str(&alias);
+    f.dst.push_str("] (");
+    for index in 0..fields.len() {
+        if index > 0 {
+            f.dst.push_str(", ");
+        }
+        f.dst.push_str(&format!("[{}]", mssql_column_alias(index)));
+    }
+    f.dst.push_str(") WHERE ");
+
+    for (index, field) in fields.iter().enumerate() {
+        if index > 0 {
+            f.dst.push_str(" AND ");
+        }
+        f.dst
+            .push_str(&format!("[{alias}].[{}] = ", mssql_column_alias(index)));
+        field.to_sql(f);
+    }
+
+    f.dst.push(')');
 }
 
 impl ToSql for &stmt::BinaryOp {
