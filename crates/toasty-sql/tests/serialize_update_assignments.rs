@@ -27,6 +27,7 @@ enum Flavor {
     Sqlite,
     Postgresql,
     Mysql,
+    Mssql,
 }
 
 /// Build a `users` table with `id INTEGER PRIMARY KEY` plus the supplied
@@ -95,6 +96,7 @@ fn render(flavor: Flavor, schema: &Schema, stmt: stmt::Statement) -> String {
         Flavor::Sqlite => Serializer::sqlite(schema).serialize(&sql_stmt),
         Flavor::Postgresql => Serializer::postgresql(schema).serialize(&sql_stmt),
         Flavor::Mysql => Serializer::mysql(schema).serialize(&sql_stmt),
+        Flavor::Mssql => Serializer::mssql(schema).serialize(&sql_stmt),
     }
 }
 
@@ -269,6 +271,34 @@ fn upsert_incoming_projection_postgresql() {
         &schema,
         upsert_with(assignments),
     ));
+}
+
+#[test]
+fn upsert_mssql_renders_merge_with_single_terminator() {
+    let schema = users_schema();
+    let mut assignments = Assignments::default();
+    assignments.set(1usize, Expr::from("x"));
+
+    let sql = render(Flavor::Mssql, &schema, upsert_with(assignments));
+
+    assert!(
+        sql.starts_with("MERGE INTO [users] WITH (HOLDLOCK) AS target"),
+        "got: {sql}"
+    );
+    assert!(
+        sql.contains("WHEN MATCHED THEN UPDATE SET target.[name] = N'x'"),
+        "got: {sql}"
+    );
+    assert!(
+        sql.contains(
+            "WHEN NOT MATCHED THEN INSERT ([id], [name], [tags]) VALUES (src.[id], src.[name], src.[tags])"
+        ),
+        "got: {sql}"
+    );
+    // A `MERGE` must be terminated, but only once — `Serializer::serialize`
+    // appends the `;`, so the statement must not add a second one.
+    assert!(sql.ends_with(";"), "got: {sql}");
+    assert!(!sql.ends_with(";;"), "got: {sql}");
 }
 
 // -----------------------------------------------------------------------------

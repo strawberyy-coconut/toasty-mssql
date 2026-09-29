@@ -15,7 +15,14 @@ impl ToSql for &stmt::Expr {
     fn to_sql(self, f: &mut super::Formatter<'_>) {
         match self {
             stmt::Expr::And(expr) => {
-                fmt!(f, Delimited(expr.operands.iter().map(AndOperand), " AND "));
+                if f.serializer.is_mssql() {
+                    fmt!(
+                        f,
+                        Delimited(expr.operands.iter().map(MssqlPredicate), " AND ")
+                    );
+                } else {
+                    fmt!(f, Delimited(expr.operands.iter().map(AndOperand), " AND "));
+                }
             }
             stmt::Expr::Between(expr) => {
                 fmt!(f, expr.expr " BETWEEN " expr.low " AND " expr.high);
@@ -275,10 +282,23 @@ impl ToSql for &stmt::Expr {
                 }
             }
             stmt::Expr::Not(expr) => {
-                fmt!(f, "NOT (" expr.expr ")");
+                // T-SQL has no boolean expression type, so the operand of `NOT`
+                // must itself be a predicate.
+                if f.serializer.is_mssql() {
+                    fmt!(f, "NOT (" MssqlPredicate(expr.expr.as_ref()) ")");
+                } else {
+                    fmt!(f, "NOT (" expr.expr ")");
+                }
             }
             stmt::Expr::Or(expr) => {
-                fmt!(f, Delimited(&expr.operands, " OR "));
+                if f.serializer.is_mssql() {
+                    fmt!(
+                        f,
+                        Delimited(expr.operands.iter().map(MssqlPredicate), " OR ")
+                    );
+                } else {
+                    fmt!(f, Delimited(&expr.operands, " OR "));
+                }
             }
             stmt::Expr::Record(expr) => {
                 let fields = Comma(expr.fields.iter());
@@ -355,6 +375,57 @@ impl ToSql for &stmt::Expr {
                 Dialect::Sqlite => fmt!(f, "NULL"),
             },
             _ => todo!("expr={:#?}", self),
+        }
+    }
+}
+
+/// Whether an expression is usable as a T-SQL predicate without a comparison.
+///
+/// T-SQL has no boolean expression type: a condition has to be a comparison, a
+/// quantified predicate, `IS NULL`, or a logical combination of those. Anything
+/// else in a condition position — a boolean column reference, or a boolean
+/// literal the folding pass produced — must be compared to `1`.
+pub(super) fn mssql_is_predicate(expr: &stmt::Expr) -> bool {
+    match expr {
+        stmt::Expr::BinaryOp(op) => matches!(
+            op.op,
+            stmt::BinaryOp::Eq
+                | stmt::BinaryOp::Ne
+                | stmt::BinaryOp::Ge
+                | stmt::BinaryOp::Gt
+                | stmt::BinaryOp::Le
+                | stmt::BinaryOp::Lt
+        ),
+        stmt::Expr::And(_)
+        | stmt::Expr::Or(_)
+        | stmt::Expr::Not(_)
+        | stmt::Expr::IsNull(_)
+        | stmt::Expr::Between(_)
+        | stmt::Expr::Like(_)
+        | stmt::Expr::StartsWith(_)
+        | stmt::Expr::InList(_)
+        | stmt::Expr::InSubquery(_)
+        | stmt::Expr::Exists(_)
+        | stmt::Expr::AnyOp(_)
+        | stmt::Expr::AllOp(_)
+        | stmt::Expr::Intersects(_)
+        | stmt::Expr::IsSuperset(_) => true,
+        _ => false,
+    }
+}
+
+/// Renders an expression where T-SQL expects a condition.
+///
+/// A non-predicate operand — a `BIT` value or column, which T-SQL cannot use as
+/// a bare condition — is compared to `1`.
+pub(super) struct MssqlPredicate<'a>(pub(super) &'a stmt::Expr);
+
+impl ToSql for MssqlPredicate<'_> {
+    fn to_sql(self, f: &mut super::Formatter<'_>) {
+        if mssql_is_predicate(self.0) {
+            fmt!(f, self.0);
+        } else {
+            fmt!(f, "(" self.0 " = 1)");
         }
     }
 }

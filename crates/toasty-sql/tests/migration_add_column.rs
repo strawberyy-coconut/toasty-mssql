@@ -232,7 +232,10 @@ fn add_column_after_reordering_tables() {
 fn add_column_not_null_mssql() {
     let col = make_column(0, 1, "name", Type::Text);
     let sql = add_column_sql(col, &Capability::MSSQL, "mssql");
-    assert_eq!(sql, "ALTER TABLE [users] ADD [name] NVARCHAR(MAX) NOT NULL;");
+    assert_eq!(
+        sql,
+        "ALTER TABLE [users] ADD [name] NVARCHAR(MAX) NOT NULL;"
+    );
 }
 
 #[test]

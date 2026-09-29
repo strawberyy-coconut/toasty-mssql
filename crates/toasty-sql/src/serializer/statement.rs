@@ -1,3 +1,4 @@
+use super::expr::MssqlPredicate;
 use super::{ColumnAlias, Comma, Delimited, Ident, ToSql};
 
 use crate::{
@@ -112,7 +113,11 @@ impl ToSql for &stmt::AddColumn {
 
         // T-SQL spells a column addition `ADD <def>`; the `COLUMN` keyword is a
         // syntax error there. (`DROP COLUMN` still takes it — see `DropColumn`.)
-        let column_keyword = if f.serializer.is_mssql() { "" } else { "COLUMN " };
+        let column_keyword = if f.serializer.is_mssql() {
+            ""
+        } else {
+            "COLUMN "
+        };
 
         fmt!(
             &mut f, "ALTER TABLE " table_name " ADD " column_keyword self.column
@@ -452,7 +457,13 @@ fn output_clause(f: &mut super::Formatter<'_>, returning: &stmt::Returning, pref
 impl ToSql for &stmt::Filter {
     fn to_sql(self, f: &mut super::Formatter<'_>) {
         if let Some(expr) = &self.expr {
-            fmt!(f, " WHERE " expr);
+            // T-SQL has no boolean expression type, so a filter that is a bare
+            // `BIT` value has to be compared to `1`.
+            if f.serializer.is_mssql() {
+                fmt!(f, " WHERE " MssqlPredicate(expr));
+            } else {
+                fmt!(f, " WHERE " expr);
+            }
         }
     }
 }
@@ -768,8 +779,8 @@ fn insert_mssql_merge(
         output_clause(f, returning, "INSERTED");
     }
 
-    // T-SQL insists a `MERGE` end with a semicolon.
-    fmt!(f, ";");
+    // T-SQL insists a `MERGE` end with a semicolon; `Serializer::serialize`
+    // appends one for every statement, so no extra terminator is emitted here.
 
     f.merge = previous_merge;
 }
@@ -1132,8 +1143,10 @@ impl ToSql for &stmt::SourceTable {
                 fmt!(f, kw join_table_ref " AS " alias);
                 if f.serializer.is_mssql() {
                     mssql_derived_column_list(f, join_table_ref);
+                    fmt!(f, " ON " MssqlPredicate(expr));
+                } else {
+                    fmt!(f, " ON " expr);
                 }
-                fmt!(f, " ON " expr);
             }
         }
     }
