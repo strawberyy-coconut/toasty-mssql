@@ -11,7 +11,7 @@ use toasty_core::{
         operation::{RawSqlRet, Transaction, TransactionMode, TypedValue},
     },
     schema::{db, db::AppliedMigration},
-    stmt,
+    stmt::{self, VisitMut},
 };
 use toasty_sql::{Serializer, stmt as sql};
 
@@ -80,14 +80,21 @@ impl toasty_core::driver::Connection for Connection {
                     None => Ret::Count,
                 },
             ),
-            Operation::QuerySql(query) => (
-                Serializer::mssql(&schema.db).serialize(&sql::Statement::from(query.stmt.clone())),
-                params::rpc_params(&query.params)?,
-                match &query.ret {
-                    Some(types) => Ret::Types(types.clone()),
-                    None => Ret::Count,
-                },
-            ),
+            Operation::QuerySql(query) => {
+                // A match-all `WHERE true` filter has no T-SQL form (see
+                // `clear_match_all_filter`); drop it before rendering.
+                let mut stmt = query.stmt.clone();
+                clear_match_all_filter(&mut stmt, &query.params);
+
+                (
+                    Serializer::mssql(&schema.db).serialize(&sql::Statement::from(stmt)),
+                    params::rpc_params(&query.params)?,
+                    match &query.ret {
+                        Some(types) => Ret::Types(types.clone()),
+                        None => Ret::Count,
+                    },
+                )
+            }
             Operation::RawSql(raw) => {
                 // The caller writes `?` markers, which `sp_executesql` names
                 // `@p1`, `@p2`, …
@@ -395,6 +402,130 @@ impl Connection {
         }
 
         Ok(ExecResponse::count(0))
+    }
+}
+
+/// Clear a `WHERE` filter that is the boolean literal `true`.
+///
+/// `Query::all()` seeds every unfiltered query with a `true` filter, and the
+/// planner emits the same for its probe CTEs. Parameter extraction turns the
+/// literal into a bind parameter, so the filter renders as `WHERE @pN`. T-SQL
+/// has no boolean type and rejects a bare bind parameter as a predicate (error
+/// 4145). `Filter` documents an absent expression as matching every row — the
+/// same predicate as `true` — so clearing the expression drops the `WHERE`
+/// clause. The parameter it would have consumed stays in the list, unused,
+/// because the engine has already numbered the rest around it.
+///
+/// Walks the whole statement, so a match-all filter nested in a subquery or a
+/// CTE is cleared too.
+fn clear_match_all_filter(stmt: &mut stmt::Statement, params: &[TypedValue]) {
+    ClearMatchAllFilter { params }.visit_mut(stmt);
+}
+
+/// Traversal backing [`clear_match_all_filter`].
+struct ClearMatchAllFilter<'a> {
+    params: &'a [TypedValue],
+}
+
+impl ClearMatchAllFilter<'_> {
+    /// Whether `expr` is the boolean literal `true`: an inline literal, or the
+    /// bind parameter the literal was extracted into.
+    fn is_true(&self, expr: &stmt::Expr) -> bool {
+        match expr {
+            stmt::Expr::Value(stmt::Value::Bool(true))
+            | stmt::Expr::Static(stmt::Value::Bool(true)) => true,
+            stmt::Expr::Arg(arg) => matches!(
+                self.params.get(arg.position),
+                Some(TypedValue {
+                    value: stmt::Value::Bool(true),
+                    ..
+                })
+            ),
+            _ => false,
+        }
+    }
+}
+
+impl VisitMut for ClearMatchAllFilter<'_> {
+    fn visit_filter_mut(&mut self, filter: &mut stmt::Filter) {
+        if filter.expr.as_ref().is_some_and(|expr| self.is_true(expr)) {
+            filter.expr = None;
+        }
+
+        stmt::visit_mut::visit_filter_mut(self, filter);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use toasty_core::{
+        schema::app::ModelId,
+        stmt::{Expr, Filter, Query, Value},
+    };
+
+    fn bool_param(value: bool) -> TypedValue {
+        TypedValue {
+            value: Value::Bool(value),
+            ty: db::Type::Boolean,
+        }
+    }
+
+    /// A `SELECT` over a dummy model with `expr` as its filter.
+    fn select_with_filter(expr: Expr) -> stmt::Statement {
+        stmt::Statement::Query(Query::new_select(ModelId(0), Filter::new(expr)))
+    }
+
+    /// The statement's filter expression, or `None` when the filter is empty.
+    fn filter_expr(stmt: &stmt::Statement) -> Option<&Expr> {
+        stmt.filter().and_then(|filter| filter.expr.as_ref())
+    }
+
+    #[test]
+    fn clears_match_all_filter_extracted_to_a_parameter() {
+        let mut stmt = select_with_filter(Expr::arg(0usize));
+        clear_match_all_filter(&mut stmt, &[bool_param(true)]);
+        assert!(filter_expr(&stmt).is_none());
+    }
+
+    #[test]
+    fn clears_inline_static_true_filter() {
+        let mut stmt = select_with_filter(Expr::Static(Value::Bool(true)));
+        clear_match_all_filter(&mut stmt, &[]);
+        assert!(filter_expr(&stmt).is_none());
+    }
+
+    #[test]
+    fn keeps_false_filter() {
+        let expected = Expr::arg(0usize);
+        let mut stmt = select_with_filter(expected.clone());
+        clear_match_all_filter(&mut stmt, &[bool_param(false)]);
+        assert_eq!(filter_expr(&stmt), Some(&expected));
+    }
+
+    #[test]
+    fn keeps_non_constant_filter() {
+        let predicate = Expr::not(Expr::arg(0usize));
+        let mut stmt = select_with_filter(predicate.clone());
+        clear_match_all_filter(&mut stmt, &[bool_param(true)]);
+        assert_eq!(filter_expr(&stmt), Some(&predicate));
+    }
+
+    #[test]
+    fn clears_nested_match_all_filter() {
+        let mut stmt = select_with_filter(Expr::exists(Query::new_select(
+            ModelId(0),
+            Filter::new(Expr::arg(0usize)),
+        )));
+        clear_match_all_filter(&mut stmt, &[bool_param(true)]);
+
+        // The outer filter is a subquery predicate, so it stays.
+        let Some(Expr::Exists(exists)) = filter_expr(&stmt) else {
+            panic!("outer filter should remain a subquery predicate");
+        };
+
+        // The nested query's match-all filter is cleared.
+        assert!(exists.subquery.filter().unwrap().expr.is_none());
     }
 }
 
