@@ -2,10 +2,10 @@
 //!
 //! [ref]: https://learn.microsoft.com/en-us/sql/t-sql/functions/mathematical-functions-transact-sql
 
-use toasty::stmt::{Expr, Path};
+use toasty::stmt::{Expr, IntoExpr, Path};
 use toasty_core::stmt;
 
-use super::{Operand, call};
+use super::{Operand, arg, call};
 
 /// Mathematical functions on a numeric column.
 ///
@@ -50,13 +50,8 @@ pub trait MssqlMath {
     }
 
     /// `ROUND(col, digits)`.
-    fn round(&self, digits: i32) -> Expr<Self::Ty> {
-        call(
-            &self.operand(),
-            Self::stmt_ty(),
-            "ROUND",
-            vec![digits.to_string()],
-        )
+    fn round(&self, digits: impl IntoExpr<i32>) -> Expr<Self::Ty> {
+        call(&self.operand(), Self::stmt_ty(), "ROUND", vec![arg(digits)])
     }
 
     /// `SQRT(col)`.
@@ -69,13 +64,8 @@ pub trait MssqlMath {
     }
 
     /// `POWER(col, n)`.
-    fn power(&self, n: f64) -> Expr<f64> {
-        call(
-            &self.operand(),
-            stmt::Type::F64,
-            "POWER",
-            vec![n.to_string()],
-        )
+    fn power(&self, n: impl IntoExpr<f64>) -> Expr<f64> {
+        call(&self.operand(), stmt::Type::F64, "POWER", vec![arg(n)])
     }
 
     /// `LOG(col)` — natural logarithm. Zero and negative inputs raise.

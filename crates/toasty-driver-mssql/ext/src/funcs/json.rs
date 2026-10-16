@@ -5,12 +5,15 @@
 //! column. That leaves the column with no constraint on it, and makes `ISJSON`
 //! the integrity check it otherwise lacks.
 //!
+//! A JSON path is bound as a parameter, not written into the statement text;
+//! see the [`funcs`](super) module.
+//!
 //! [ref]: https://learn.microsoft.com/en-us/sql/t-sql/functions/json-functions-transact-sql
 
 use toasty::stmt::{Expr, Path};
 use toasty_core::stmt;
 
-use super::{Operand, call, check, text};
+use super::{Operand, arg, call, check};
 
 /// JSON functions on a text column.
 ///
@@ -40,29 +43,33 @@ pub trait MssqlJson {
 
     /// `ISJSON(col, ARRAY)` — SQL Server 2022 and later.
     fn is_json_array(&self) -> Expr<bool> {
-        check(&self.operand(), "ISJSON", vec!["ARRAY".to_owned()])
+        check(&self.operand(), "ISJSON", vec!["ARRAY".into()])
     }
 
     /// `ISJSON(col, OBJECT)` — SQL Server 2022 and later.
     fn is_json_object(&self) -> Expr<bool> {
-        check(&self.operand(), "ISJSON", vec!["OBJECT".to_owned()])
+        check(&self.operand(), "ISJSON", vec!["OBJECT".into()])
     }
 
     /// `ISJSON(col, SCALAR)` — SQL Server 2022 and later.
     fn is_json_scalar(&self) -> Expr<bool> {
-        check(&self.operand(), "ISJSON", vec!["SCALAR".to_owned()])
+        check(&self.operand(), "ISJSON", vec!["SCALAR".into()])
     }
 
     /// `ISJSON(col, VALUE)` — any JSON value, object or scalar.
     fn is_json_value(&self) -> Expr<bool> {
-        check(&self.operand(), "ISJSON", vec!["VALUE".to_owned()])
+        check(&self.operand(), "ISJSON", vec!["VALUE".into()])
     }
 
     /// `JSON_PATH_EXISTS(col, '$.path')` — SQL Server 2022 and later.
     ///
     /// `path` is written without the leading `$.`, so `"a.b"` tests `$.a.b`.
     fn json_path_exists(&self, path: &str) -> Expr<bool> {
-        check(&self.operand(), "JSON_PATH_EXISTS", vec![json_path(path)])
+        check(
+            &self.operand(),
+            "JSON_PATH_EXISTS",
+            vec![arg::<String>(json_path(path))],
+        )
     }
 
     /// `JSON_VALUE(col, '$.path')` — the scalar at `path`, or NULL.
@@ -76,7 +83,7 @@ pub trait MssqlJson {
             &self.operand(),
             stmt::Type::String,
             "JSON_VALUE",
-            vec![json_path(path)],
+            vec![arg::<String>(json_path(path))],
         )
     }
 
@@ -90,7 +97,7 @@ pub trait MssqlJson {
             &self.operand(),
             stmt::Type::String,
             "JSON_QUERY",
-            vec![json_path(path)],
+            vec![arg::<String>(json_path(path))],
         )
     }
 }
@@ -107,8 +114,8 @@ impl MssqlJson for Expr<String> {
     }
 }
 
-/// `N'$.a.b'` — the JSON path literal these functions take, from a path written
-/// without the leading `$.`.
+/// `$.a.b` — the JSON path these functions take, from a path written without the
+/// leading `$.`. Bound as a parameter by the callers.
 fn json_path(path: &str) -> String {
-    text(&format!("$.{path}"))
+    format!("$.{path}")
 }

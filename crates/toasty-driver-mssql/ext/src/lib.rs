@@ -24,8 +24,12 @@
 //!   the offset it is displayed in a `datetimeoffset` column.
 //! * `funcs-json`, `funcs-string`, `funcs-math`, `funcs-date` — SQL Server's
 //!   built-in functions as extension traits, one Cargo feature per Microsoft
-//!   [category][cats]; `funcs` turns on all four. The [`funcs`] module documents
-//!   how a call is carried through an AST that has no node for one.
+//!   [category][cats]; `funcs` turns on those and `funcs-fulltext`. The
+//!   [`funcs`] module documents how a call is carried through an AST that has no
+//!   node for one.
+//! * `funcs-fulltext` — [`MssqlFullText`], the `CONTAINS` / `FREETEXT`
+//!   predicates. Also split out on its own, because a column needs a full-text
+//!   index to use them.
 //!
 //! [cats]: https://learn.microsoft.com/en-us/sql/t-sql/functions/functions
 //! [`funcs`]: https://docs.rs/toasty-driver-mssql-ext/latest/toasty_driver_mssql_ext/#reexports
@@ -48,6 +52,8 @@ pub use datetime_offset::MssqlDateTimeOffset;
 pub use funcs::DatePart;
 #[cfg(feature = "funcs-date")]
 pub use funcs::MssqlDate;
+#[cfg(feature = "funcs-fulltext")]
+pub use funcs::MssqlFullText;
 #[cfg(feature = "funcs-json")]
 pub use funcs::MssqlJson;
 #[cfg(feature = "funcs-math")]

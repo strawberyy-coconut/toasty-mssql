@@ -8,18 +8,23 @@
 //!
 //! ```text
 //! FuncJsonExtract {
-//!     base: <the column expression>,           // rendered as tbl_0_0.[name]
-//!     path: ["!ISJSON", "{base}", "ARRAY"],    // name, then the arguments
-//!     ty: <the result type>,
+//!     base: Expr::Record([ <operand>, <arg₁>, <arg₂>, … ]),
+//!     // or, when the call takes no expression arguments, the bare operand.
+//!     path: ["!ISJSON", "{base}", "ARRAY"],     // name, then the arguments
+//!     ty:   <the result type>,
 //! }
 //! ```
 //!
 //! * `!` marks the path as a call rather than a document path extraction. It
 //!   cannot collide with one, because those are built from Rust field names and
 //!   `!` is not permitted in an identifier.
-//! * `{base}` marks *where* the operand goes, because T-SQL is not consistent
-//!   about it: `ISJSON(col, ARRAY)` takes its subject first, `DATEPART(day, col)`
-//!   and `CHARINDEX(N'a', col)` take it last.
+//! * `{base}` is the operand, `{base:N}` is field `N` of the `Record` base. The
+//!   renderer substitutes the corresponding expression, so a value placed there
+//!   is a real bind parameter — `CONTAINS([body], @p1)`, not `CONTAINS([body],
+//!   N'…')`.
+//! * A `%keyword` token (`%LANGUAGE`) opens a clause: it is emitted after a
+//!   comma and the argument that follows it is separated by a space, giving
+//!   `CONTAINS([body], @p1, LANGUAGE @p2)`.
 //! * `!.` marks a call that is a *method* on the operand, which is how T-SQL
 //!   spells its whole spatial vocabulary: `col.STArea()`.
 //!
@@ -27,22 +32,27 @@
 //! recursively, a call can also be the receiver of another — which is what makes
 //! `col.STUnion(…).STArea()` expressible.
 //!
-//! The functions are grouped the way Microsoft groups them, one Cargo feature
-//! per category: `funcs-json`, `funcs-string`, `funcs-math` and `funcs-date`,
-//! with `funcs` turning on all four. Spatial methods ride with the `spatial`
-//! feature, because they need the types it defines.
+//! # Arguments are bound, not inlined
+//!
+//! Every argument the caller supplies — the search term, a substring length, a
+//! well-known text geometry — is carried as an expression in the `Record` base
+//! and reaches the database as a bind parameter. Only fixed T-SQL *keywords*
+//! (the `ARRAY` of `ISJSON`, the `day` of `DATEPART`) are written into the SQL,
+//! and those come from Rust enums rather than from the caller. This removes the
+//! injection footgun an inlined string would be: no API writes a caller's text
+//! into the statement. The one inline escape hatch, [`lit`], takes numeric types
+//! only and so cannot carry a quote.
 //!
 //! # What this cannot do
 //!
-//! * **One expression operand.** A `FuncJsonExtract` has a single `base`, so
-//!   `CHARINDEX` can take a column and a literal, but not two columns. The
-//!   remaining arguments travel as escaped text in `path`.
-//! * **No bind parameters inside the call.** Every argument is inlined, so no
-//!   argument may be untrusted input.
+//! * **One operand, then expression arguments.** The `Record` base holds the
+//!   operand and the call's bindable arguments, so a call can take several. Any
+//!   argument that is not one of those two kinds travels as inline text in
+//!   `path`, which is how keywords are written.
 //! * **Filters only.** The engine drops a non-path expression in a projection,
 //!   so these work in `WHERE` and nowhere a value is selected.
 //!
-//! All three limitations disappear with an upstream
+//! Both limitations disappear with an upstream
 //! `ExprFunc::Custom(FuncCustom { name, args, ret })`, which is the real fix.
 
 /// The wire-format markers that carry a call in a `FuncJsonExtract` path.
@@ -102,21 +112,72 @@ mod build {
         }
     }
 
+    /// One argument of a carried call.
+    pub(crate) enum Arg {
+        /// The operand, substituted wherever it appears in the argument list.
+        Operand,
+        /// A bindable expression.
+        Expr(stmt::Expr),
+        /// An inline literal token, such as an enum keyword (`day`) or `ARRAY`.
+        Raw(String),
+        /// A keyword that introduces a clause whose value follows it: emitted
+        /// after a comma, with the next argument separated by a space.
+        Keyword(&'static str),
+    }
+
+    impl From<&'static str> for Arg {
+        fn from(value: &'static str) -> Self {
+            Arg::Raw(value.to_owned())
+        }
+    }
+
+    impl From<String> for Arg {
+        fn from(value: String) -> Self {
+            Arg::Raw(value)
+        }
+    }
+
+    /// A bindable expression argument, from anything that converts to an
+    /// `Expr<T>`.
+    pub(crate) fn arg<T>(value: impl IntoExpr<T>) -> Arg {
+        Arg::Expr(Operand::operand(&value.into_expr()))
+    }
+
     /// Encodes a call as a `FuncJsonExtract`.
     ///
-    /// `prefix` is what goes between the marker and the name — empty for a
-    /// function, [`METHOD`] for a method — and `args` must already carry the
-    /// [`OPERAND`] token if the operand is one of them.
-    pub(crate) fn encode(
-        base: stmt::Expr,
+    /// `operand` becomes field 0 of the `Record` base and each [`Arg::Expr`]
+    /// follows it; `args` gives the final T-SQL argument order, so the operand
+    /// token may sit anywhere in it. A call with no expression arguments keeps
+    /// the bare operand as `base`, so its wire form is unchanged.
+    fn encode(
+        operand: stmt::Expr,
         ty: stmt::Type,
         prefix: &str,
         name: &str,
-        args: Vec<String>,
+        args: Vec<Arg>,
     ) -> stmt::Expr {
+        let mut fields = vec![operand];
         let mut path = Vec::with_capacity(args.len() + 1);
         path.push(format!("{MARKER}{prefix}{name}"));
-        path.extend(args);
+
+        for arg in args {
+            match arg {
+                Arg::Operand => path.push(OPERAND.to_owned()),
+                Arg::Expr(expr) => {
+                    let index = fields.len();
+                    fields.push(expr);
+                    path.push(format!("{{base:{index}}}"));
+                }
+                Arg::Raw(raw) => path.push(raw),
+                Arg::Keyword(keyword) => path.push(format!("%{keyword}")),
+            }
+        }
+
+        let base = if fields.len() == 1 {
+            fields.pop().expect("the operand is always present")
+        } else {
+            stmt::Expr::record(fields)
+        };
 
         stmt::Expr::Func(stmt::ExprFunc::JsonExtract(stmt::FuncJsonExtract {
             base: Box::new(base),
@@ -125,18 +186,14 @@ mod build {
         }))
     }
 
-    /// A T-SQL string literal: `N`-prefixed, with `'` doubled.
-    pub(crate) fn text(value: &str) -> String {
-        format!("N'{}'", value.replace('\'', "''"))
-    }
-
-    /// `expr = 1` — T-SQL has no boolean expression type, and the comparison is
-    /// also the shape the engine's boolean-position check accepts.
-    pub(crate) fn truthy(expr: stmt::Expr) -> stmt::Expr {
+    /// `expr = true` — the shape the engine's boolean-position check accepts for
+    /// a call that answers a predicate. See [`crate::funcs`] for why the
+    /// right-hand side is a schema-fixed `Static` rather than a bound value.
+    fn truthy(expr: stmt::Expr) -> stmt::Expr {
         stmt::Expr::binary_op(
             expr,
             stmt::BinaryOp::Eq,
-            stmt::Expr::Value(stmt::Value::Bool(true)),
+            stmt::Expr::Static(stmt::Value::Bool(true)),
         )
     }
 
@@ -145,11 +202,9 @@ mod build {
         base: &O,
         ty: stmt::Type,
         name: &str,
-        args: Vec<String>,
+        mut args: Vec<Arg>,
     ) -> Expr<T> {
-        let mut args = args;
-        args.insert(0, OPERAND.to_owned());
-
+        args.insert(0, Arg::Operand);
         Expr::from_untyped(encode(base.operand(), ty, "", name, args))
     }
 
@@ -158,18 +213,15 @@ mod build {
         base: &O,
         ty: stmt::Type,
         name: &str,
-        mut args: Vec<String>,
+        mut args: Vec<Arg>,
     ) -> Expr<T> {
-        args.push(OPERAND.to_owned());
-
+        args.push(Arg::Operand);
         Expr::from_untyped(encode(base.operand(), ty, "", name, args))
     }
 
-    /// `name(operand[, args…]) = 1`, for functions that answer yes or no.
-    pub(crate) fn check<O: Operand>(base: &O, name: &str, args: Vec<String>) -> Expr<bool> {
-        let mut args = args;
-        args.insert(0, OPERAND.to_owned());
-
+    /// `name(operand[, args…]) = true`, for functions that answer yes or no.
+    pub(crate) fn check<O: Operand>(base: &O, name: &str, mut args: Vec<Arg>) -> Expr<bool> {
+        args.insert(0, Arg::Operand);
         Expr::from_untyped(truthy(encode(
             base.operand(),
             stmt::Type::Bool,
@@ -184,13 +236,13 @@ mod build {
         base: &O,
         ty: stmt::Type,
         name: &str,
-        args: Vec<String>,
+        args: Vec<Arg>,
     ) -> Expr<T> {
         Expr::from_untyped(encode(base.operand(), ty, &METHOD.to_string(), name, args))
     }
 
-    /// `operand.name(args…) = 1`.
-    pub(crate) fn method_check<O: Operand>(base: &O, name: &str, args: Vec<String>) -> Expr<bool> {
+    /// `operand.name(args…) = true`.
+    pub(crate) fn method_check<O: Operand>(base: &O, name: &str, args: Vec<Arg>) -> Expr<bool> {
         Expr::from_untyped(truthy(encode(
             base.operand(),
             stmt::Type::Bool,
@@ -199,6 +251,18 @@ mod build {
             args,
         )))
     }
+
+    /// `geometry::STGeomFromText(wkt, srid)` — a schema-qualified constructor
+    /// call, as an argument. Both the well-known text and the SRID are bound.
+    pub(crate) fn constructor_arg(
+        name: &str,
+        wkt: impl IntoExpr<String>,
+        srid: impl IntoExpr<i32>,
+    ) -> Arg {
+        let wkt = Operand::operand(&wkt.into_expr());
+        let args = vec![Arg::Operand, arg(srid)];
+        Arg::Expr(encode(wkt, stmt::Type::Bytes, "", name, args))
+    }
 }
 
 // No single category uses all of these, so which ones are unused depends on
@@ -206,10 +270,14 @@ mod build {
 // just brings them up to the modules that do use them.
 #[allow(unused_imports)]
 #[cfg(feature = "toasty")]
-pub(crate) use build::{Operand, call, call_last, check, method, method_check, text};
+pub(crate) use build::{
+    Arg, Operand, arg, call, call_last, check, constructor_arg, method, method_check,
+};
 
 #[cfg(feature = "funcs-date")]
 mod date;
+#[cfg(feature = "funcs-fulltext")]
+mod fulltext;
 #[cfg(feature = "funcs-json")]
 mod json;
 #[cfg(feature = "funcs-math")]
@@ -219,6 +287,8 @@ mod string;
 
 #[cfg(feature = "funcs-date")]
 pub use date::{DatePart, MssqlDate};
+#[cfg(feature = "funcs-fulltext")]
+pub use fulltext::MssqlFullText;
 #[cfg(feature = "funcs-json")]
 pub use json::MssqlJson;
 #[cfg(feature = "funcs-math")]
@@ -281,16 +351,4 @@ mssql_literal! {
 #[cfg(feature = "toasty")]
 pub fn lit<T: MssqlLiteral>(value: T) -> Expr<T> {
     Expr::from_untyped(toasty_core::stmt::Expr::Ident(value.sql_text()))
-}
-
-#[cfg(all(test, feature = "toasty"))]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn escapes_a_string_literal() {
-        assert_eq!(build::text("plain"), "N'plain'");
-        assert_eq!(build::text("o'brien"), "N'o''brien'");
-        assert_eq!(build::text("'; DROP TABLE x --"), "N'''; DROP TABLE x --'");
-    }
 }

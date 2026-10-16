@@ -356,10 +356,15 @@ impl<'a> Serializer<'a> {
 // (`base`) and a `Vec<String>` (`path`):
 //
 //     FuncJsonExtract {
-//         base: <the column expression>,
-//         path: ["!ISJSON", "{base}", "ARRAY"],   // name, then the arguments
+//         base: Expr::Record([ <operand>, <term> ]), // or the bare operand
+//         path: ["!CONTAINS", "{base}", "{base:1}"], // name, then the arguments
 //         ty:   <the result type>,
 //     }
+//
+// Field 0 of the `Record` is the operand, and each later field is a bindable
+// argument the call carries to the database. `{base}` names the operand and
+// `{base:N}` names field `N`; a token with neither form — a keyword like
+// `ARRAY` — is written into the SQL verbatim.
 //
 // The markers below distinguish a call from a real document path extraction;
 // the SQL Server driver's model-facing function traits use them to encode a
@@ -378,7 +383,8 @@ pub const MSSQL_FUNC_METHOD: char = '.';
 ///
 /// Not every T-SQL function takes its subject first: `DATEPART(day, col)` and
 /// `CHARINDEX(N'needle', col)` both take it last, so the argument list carries
-/// the position rather than assuming it.
+/// the position rather than assuming it. A carried expression argument uses the
+/// numbered form `{base:N}` instead — see [`MssqlFuncCall`].
 #[doc(hidden)]
 pub const MSSQL_FUNC_OPERAND: &str = "{base}";
 
@@ -386,7 +392,8 @@ pub const MSSQL_FUNC_OPERAND: &str = "{base}";
 pub(crate) struct MssqlFuncCall<'a> {
     /// The function or method name, with any prefix already stripped.
     pub(crate) name: &'a str,
-    /// Already-escaped T-SQL text for each argument.
+    /// The argument tokens: `{base}` / `{base:N}` for a carried expression,
+    /// `%keyword` for a clause introducer, and anything else verbatim text.
     pub(crate) args: &'a [String],
     /// Whether the operand is the receiver (`col.STArea()`) rather than an
     /// argument (`ISJSON(col)`).
@@ -405,9 +412,4 @@ pub(crate) fn mssql_decode_func_call(path: &[String]) -> Option<MssqlFuncCall<'_
     };
 
     Some(MssqlFuncCall { name, args, method })
-}
-
-/// Whether `arg` is the placeholder for the operand rather than a literal.
-pub(crate) fn mssql_func_is_operand(arg: &str) -> bool {
-    arg == MSSQL_FUNC_OPERAND
 }

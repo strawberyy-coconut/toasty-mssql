@@ -11,10 +11,10 @@
 //!
 //! [ref]: https://learn.microsoft.com/en-us/sql/t-sql/functions/date-and-time-data-types-and-functions-transact-sql
 
-use toasty::stmt::{Expr, Path};
+use toasty::stmt::{Expr, IntoExpr, Path};
 use toasty_core::stmt;
 
-use super::{Operand, call, call_last};
+use super::{Operand, arg, call, call_last};
 
 /// A date part keyword, for the functions that name one.
 ///
@@ -109,7 +109,7 @@ pub trait MssqlDate {
             &self.operand(),
             stmt::Type::I32,
             "DATEPART",
-            vec!["hour".to_owned()],
+            vec!["hour".into()],
         )
     }
 
@@ -119,7 +119,7 @@ pub trait MssqlDate {
             &self.operand(),
             stmt::Type::I32,
             "DATEPART",
-            vec!["minute".to_owned()],
+            vec!["minute".into()],
         )
     }
 
@@ -129,7 +129,7 @@ pub trait MssqlDate {
             &self.operand(),
             stmt::Type::I32,
             "DATEPART",
-            vec!["second".to_owned()],
+            vec!["second".into()],
         )
     }
 
@@ -139,17 +139,17 @@ pub trait MssqlDate {
             &self.operand(),
             stmt::Type::I32,
             "DATEPART",
-            vec![part.keyword().to_owned()],
+            vec![part.keyword().into()],
         )
     }
 
     /// `DATEADD(part, n, col)` — `n` may be negative.
-    fn date_add(&self, part: DatePart, n: i64) -> Expr<Self::Ty> {
+    fn date_add(&self, part: DatePart, n: impl IntoExpr<i64>) -> Expr<Self::Ty> {
         call_last(
             &self.operand(),
             Self::stmt_ty(),
             "DATEADD",
-            vec![part.keyword().to_owned(), n.to_string()],
+            vec![part.keyword().into(), arg(n)],
         )
     }
 
@@ -159,7 +159,7 @@ pub trait MssqlDate {
             &self.operand(),
             Self::stmt_ty(),
             "DATETRUNC",
-            vec![part.keyword().to_owned()],
+            vec![part.keyword().into()],
         )
     }
 
@@ -169,13 +169,8 @@ pub trait MssqlDate {
     }
 
     /// `EOMONTH(col, n)` — shifted `n` months from the column's month.
-    fn eomonth_offset(&self, n: i32) -> Expr<Self::Ty> {
-        call(
-            &self.operand(),
-            Self::stmt_ty(),
-            "EOMONTH",
-            vec![n.to_string()],
-        )
+    fn eomonth_offset(&self, n: impl IntoExpr<i32>) -> Expr<Self::Ty> {
+        call(&self.operand(), Self::stmt_ty(), "EOMONTH", vec![arg(n)])
     }
 }
 

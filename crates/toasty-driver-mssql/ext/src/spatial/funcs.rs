@@ -25,10 +25,10 @@
 //! `geometry::STGeomFromText(…)` for a `geometry` column and
 //! `geography::STGeomFromText(…)` for a `geography` one. Note the coordinate
 //! order for each — see [`MssqlSpatial::st_distance`].
-use toasty::stmt::{Expr, Path};
+use toasty::stmt::{Expr, IntoExpr, Path};
 use toasty_core::stmt;
 
-use crate::funcs::{Operand, method, method_check, text};
+use crate::funcs::{Arg, Operand, arg, constructor_arg, method, method_check};
 
 use super::{MssqlGeography, MssqlGeometry};
 
@@ -50,7 +50,7 @@ pub trait MssqlSpatial {
     // -- Predicates, each taking another shape -------------------------------
 
     /// `col.STIntersects(other)` — `1` when the two shapes share any point.
-    fn st_intersects(&self, wkt: &str, srid: i32) -> Expr<bool> {
+    fn st_intersects(&self, wkt: impl IntoExpr<String>, srid: impl IntoExpr<i32>) -> Expr<bool> {
         method_check(
             &self.operand(),
             "STIntersects",
@@ -61,7 +61,7 @@ pub trait MssqlSpatial {
     /// `col.STContains(other)` — `1` when `other` lies entirely within `col`.
     ///
     /// Not symmetric, and not reflexive: a value does not contain itself.
-    fn st_contains(&self, wkt: &str, srid: i32) -> Expr<bool> {
+    fn st_contains(&self, wkt: impl IntoExpr<String>, srid: impl IntoExpr<i32>) -> Expr<bool> {
         method_check(
             &self.operand(),
             "STContains",
@@ -70,7 +70,7 @@ pub trait MssqlSpatial {
     }
 
     /// `col.STWithin(other)` — the inverse of [`st_contains`](Self::st_contains).
-    fn st_within(&self, wkt: &str, srid: i32) -> Expr<bool> {
+    fn st_within(&self, wkt: impl IntoExpr<String>, srid: impl IntoExpr<i32>) -> Expr<bool> {
         method_check(
             &self.operand(),
             "STWithin",
@@ -82,7 +82,7 @@ pub trait MssqlSpatial {
     ///
     /// Compares the *shape*, not the text: two different WKT spellings of the
     /// same region are equal.
-    fn st_equals(&self, wkt: &str, srid: i32) -> Expr<bool> {
+    fn st_equals(&self, wkt: impl IntoExpr<String>, srid: impl IntoExpr<i32>) -> Expr<bool> {
         method_check(
             &self.operand(),
             "STEquals",
@@ -91,7 +91,7 @@ pub trait MssqlSpatial {
     }
 
     /// `col.STDisjoint(other)` — `1` when the two share no point at all.
-    fn st_disjoint(&self, wkt: &str, srid: i32) -> Expr<bool> {
+    fn st_disjoint(&self, wkt: impl IntoExpr<String>, srid: impl IntoExpr<i32>) -> Expr<bool> {
         method_check(
             &self.operand(),
             "STDisjoint",
@@ -101,7 +101,7 @@ pub trait MssqlSpatial {
 
     /// `col.STOverlaps(other)` — `1` when they share points but neither
     /// contains the other.
-    fn st_overlaps(&self, wkt: &str, srid: i32) -> Expr<bool> {
+    fn st_overlaps(&self, wkt: impl IntoExpr<String>, srid: impl IntoExpr<i32>) -> Expr<bool> {
         method_check(
             &self.operand(),
             "STOverlaps",
@@ -156,7 +156,7 @@ pub trait MssqlSpatial {
     /// reads `wkt` as `(x y)`. A `geography` reads it as `(lat long)` — the
     /// opposite order — which is the same trap documented on the codec, and the
     /// reason the two are separate Rust types rather than one with a parameter.
-    fn st_distance(&self, wkt: &str, srid: i32) -> Expr<f64> {
+    fn st_distance(&self, wkt: impl IntoExpr<String>, srid: impl IntoExpr<i32>) -> Expr<f64> {
         method(
             &self.operand(),
             stmt::Type::F64,
@@ -195,7 +195,7 @@ pub trait MssqlSpatial {
     ///
     /// Answers a shape, so it needs another call to say anything about it:
     /// `st_union(…).st_area()`.
-    fn st_union(&self, wkt: &str, srid: i32) -> Expr<Self::Shape> {
+    fn st_union(&self, wkt: impl IntoExpr<String>, srid: impl IntoExpr<i32>) -> Expr<Self::Shape> {
         method(
             &self.operand(),
             stmt::Type::Bytes,
@@ -205,7 +205,11 @@ pub trait MssqlSpatial {
     }
 
     /// `col.STIntersection(other)` — the points in both.
-    fn st_intersection(&self, wkt: &str, srid: i32) -> Expr<Self::Shape> {
+    fn st_intersection(
+        &self,
+        wkt: impl IntoExpr<String>,
+        srid: impl IntoExpr<i32>,
+    ) -> Expr<Self::Shape> {
         method(
             &self.operand(),
             stmt::Type::Bytes,
@@ -215,7 +219,11 @@ pub trait MssqlSpatial {
     }
 
     /// `col.STDifference(other)` — the points in `col` that are not in `other`.
-    fn st_difference(&self, wkt: &str, srid: i32) -> Expr<Self::Shape> {
+    fn st_difference(
+        &self,
+        wkt: impl IntoExpr<String>,
+        srid: impl IntoExpr<i32>,
+    ) -> Expr<Self::Shape> {
         method(
             &self.operand(),
             stmt::Type::Bytes,
@@ -225,7 +233,11 @@ pub trait MssqlSpatial {
     }
 
     /// `col.STSymDifference(other)` — the points in exactly one of the two.
-    fn st_sym_difference(&self, wkt: &str, srid: i32) -> Expr<Self::Shape> {
+    fn st_sym_difference(
+        &self,
+        wkt: impl IntoExpr<String>,
+        srid: impl IntoExpr<i32>,
+    ) -> Expr<Self::Shape> {
         method(
             &self.operand(),
             stmt::Type::Bytes,
@@ -238,12 +250,12 @@ pub trait MssqlSpatial {
     ///
     /// On a `geography` column this answers NULL, not an error, when the result
     /// would exceed a hemisphere — as do the four set operations above.
-    fn st_buffer(&self, distance: f64) -> Expr<Self::Shape> {
+    fn st_buffer(&self, distance: impl IntoExpr<f64>) -> Expr<Self::Shape> {
         method(
             &self.operand(),
             stmt::Type::Bytes,
             "STBuffer",
-            vec![distance.to_string()],
+            vec![arg(distance)],
         )
     }
 }
@@ -261,7 +273,7 @@ pub trait MssqlGeometryExt {
     fn operand(&self) -> stmt::Expr;
 
     /// `col.STTouches(other)` — `1` when they meet only at their boundaries.
-    fn st_touches(&self, wkt: &str, srid: i32) -> Expr<bool> {
+    fn st_touches(&self, wkt: impl IntoExpr<String>, srid: impl IntoExpr<i32>) -> Expr<bool> {
         method_check(
             &self.operand(),
             "STTouches",
@@ -271,7 +283,7 @@ pub trait MssqlGeometryExt {
 
     /// `col.STCrosses(other)` — `1` when they cross in a lower dimension than
     /// either of them.
-    fn st_crosses(&self, wkt: &str, srid: i32) -> Expr<bool> {
+    fn st_crosses(&self, wkt: impl IntoExpr<String>, srid: impl IntoExpr<i32>) -> Expr<bool> {
         method_check(
             &self.operand(),
             "STCrosses",
@@ -402,8 +414,9 @@ impl MssqlGeographyExt for Expr<MssqlGeography> {
     }
 }
 
-/// `geometry::STGeomFromText(N'POINT(1 2)', 4326)` — the constructor for the
-/// column's own type, so a geography column gets a geography argument.
-fn other(constructor: &str, wkt: &str, srid: i32) -> String {
-    format!("{constructor}::STGeomFromText({}, {srid})", text(wkt))
+/// `geometry::STGeomFromText(@p1, @p2)` — the constructor for the column's own
+/// type, so a geography column gets a geography argument. Both the well-known
+/// text and the SRID travel as bind parameters.
+fn other(constructor: &str, wkt: impl IntoExpr<String>, srid: impl IntoExpr<i32>) -> Arg {
+    constructor_arg(&format!("{constructor}::STGeomFromText"), wkt, srid)
 }

@@ -422,12 +422,37 @@ pub(super) struct MssqlPredicate<'a>(pub(super) &'a stmt::Expr);
 
 impl ToSql for MssqlPredicate<'_> {
     fn to_sql(self, f: &mut super::Formatter<'_>) {
-        if mssql_is_predicate(self.0) {
+        // `CONTAINS` / `FREETEXT` are predicates, not `bit`-valued functions, so
+        // they cannot be compared to `1`. The ext crate carries them wrapped as
+        // `call = <true>` to satisfy the engine's boolean-position check; here
+        // the comparison is dropped and the bare predicate is emitted.
+        if let Some((name, func)) = mssql_bare_predicate(self.0) {
+            debug_assert!(matches!(name, "!CONTAINS" | "!FREETEXT"));
+            serialize_mssql_json_extract(f, func);
+        } else if mssql_is_predicate(self.0) {
             fmt!(f, self.0);
         } else {
             fmt!(f, "(" self.0 " = 1)");
         }
     }
+}
+
+/// A carried call that is itself a T-SQL predicate, wrapped by the ext crate as
+/// `call = <boolean true>` so the engine's boolean-position check accepts it.
+/// Returns the call's marker name and the node, so the comparison can be
+/// dropped and the call emitted bare.
+fn mssql_bare_predicate(expr: &stmt::Expr) -> Option<(&str, &stmt::FuncJsonExtract)> {
+    let stmt::Expr::BinaryOp(op) = expr else {
+        return None;
+    };
+    if !matches!(op.op, stmt::BinaryOp::Eq) {
+        return None;
+    }
+    let stmt::Expr::Func(stmt::ExprFunc::JsonExtract(func)) = op.lhs.as_ref() else {
+        return None;
+    };
+    let name = func.path.first().map(String::as_str)?;
+    (name == "!CONTAINS" || name == "!FREETEXT").then_some((name, func))
 }
 
 /// A single operand of an `AND` chain.
@@ -609,6 +634,28 @@ fn pg_json_cast(ty: &stmt::Type) -> Option<&'static str> {
     })
 }
 
+/// The `index`th expression a carried call's `Record` base holds: field 0 is
+/// the operand, fields 1.. are the call's bindable arguments. A base that is
+/// not a `Record` carries only the operand, so it answers for `index == 0`.
+fn mssql_call_field(base: &stmt::Expr, index: usize) -> Option<&stmt::Expr> {
+    match base {
+        stmt::Expr::Record(record) => record.fields.get(index),
+        _ if index == 0 => Some(base),
+        _ => None,
+    }
+}
+
+/// Parse an argument token that asks for one of the call's carried
+/// expressions: `{base}` is the operand (field 0), `{base:N}` is field `N`.
+/// Returns `None` for a literal or `%keyword` token.
+fn mssql_call_field_index(arg: &str) -> Option<usize> {
+    let inner = arg.strip_prefix('{')?.strip_suffix('}')?;
+    if inner == "base" {
+        return Some(0);
+    }
+    inner.strip_prefix("base:")?.parse().ok()
+}
+
 /// Renders a SQL Server document path read, or a carried scalar function call.
 ///
 /// `JSON_VALUE` returns a scalar as `nvarchar(4000)` whatever it actually
@@ -626,9 +673,13 @@ fn serialize_mssql_json_extract(f: &mut super::Formatter<'_>, func: &stmt::FuncJ
     // read; the `!` marker is what separates them.
     if let Some(call) = super::mssql_decode_func_call(&func.path) {
         if call.method {
-            // A method hangs off the operand — `col.STArea()` — because that is
-            // the only form T-SQL offers for it.
-            func.base.as_ref().to_sql(f);
+            // A method hangs off its receiver — `col.STArea()` — because that is
+            // the only form T-SQL offers for it. The receiver is the base's
+            // first field (the base itself when the call takes no expression
+            // arguments).
+            mssql_call_field(&func.base, 0)
+                .expect("a carried call always has an operand")
+                .to_sql(f);
             f.dst.push('.');
             f.dst.push_str(call.name);
             f.dst.push('(');
@@ -637,12 +688,24 @@ fn serialize_mssql_json_extract(f: &mut super::Formatter<'_>, func: &stmt::FuncJ
             f.dst.push('(');
         }
 
+        // Arguments are literal tokens or expressions carried in the `Record`
+        // base. A `%keyword` token (`%LANGUAGE`) opens a keyword clause: it is
+        // emitted after a comma and the argument that follows it is separated
+        // by a space instead of a comma — `..., LANGUAGE @p2`.
+        let mut space_before_next = false;
         for (index, arg) in call.args.iter().enumerate() {
             if index > 0 {
-                f.dst.push_str(", ");
+                f.dst.push_str(if space_before_next { " " } else { ", " });
             }
-            if super::mssql_func_is_operand(arg) {
-                func.base.as_ref().to_sql(f);
+            space_before_next = false;
+
+            if let Some(field) = mssql_call_field_index(arg) {
+                mssql_call_field(&func.base, field)
+                    .unwrap_or_else(|| panic!("carried call argument {field} is out of range"))
+                    .to_sql(f);
+            } else if let Some(keyword) = arg.strip_prefix('%') {
+                f.dst.push_str(keyword);
+                space_before_next = true;
             } else {
                 f.dst.push_str(arg);
             }
@@ -831,5 +894,125 @@ impl ToSql for &stmt::BinaryOp {
             stmt::BinaryOp::Add => "+",
             stmt::BinaryOp::Sub => "-",
         })
+    }
+}
+
+#[cfg(test)]
+mod carried_call_tests {
+    use super::*;
+    use toasty_core::schema::db;
+
+    fn render_predicate(expr: &stmt::Expr) -> String {
+        let schema = db::Schema::default();
+        let serializer = crate::serializer::Serializer::mssql(&schema);
+        let mut dst = String::new();
+        let mut arg_positions = Vec::new();
+        let mut f = crate::serializer::Formatter {
+            serializer: &serializer,
+            cx: crate::serializer::ExprContext::new(&schema),
+            dst: &mut dst,
+            depth: 0,
+            alias: false,
+            in_insert: false,
+            assignment_table: None,
+            arg_positions: &mut arg_positions,
+            row_lock: false,
+            merge: false,
+            output: None,
+            insert_columns: None,
+        };
+        MssqlPredicate(expr).to_sql(&mut f);
+        dst
+    }
+
+    fn func(name: &str, args: &[&str], fields: Vec<stmt::Expr>, ty: stmt::Type) -> stmt::Expr {
+        let base = if fields.len() == 1 {
+            fields.into_iter().next().unwrap()
+        } else {
+            stmt::Expr::record(fields)
+        };
+        let mut path = vec![format!("!{name}")];
+        path.extend(args.iter().map(|s| (*s).to_owned()));
+        stmt::Expr::Func(stmt::ExprFunc::JsonExtract(stmt::FuncJsonExtract {
+            base: Box::new(base),
+            path,
+            ty,
+        }))
+    }
+
+    fn method(name: &str, args: &[&str], fields: Vec<stmt::Expr>, ty: stmt::Type) -> stmt::Expr {
+        let mut path = vec![format!("!.{name}")];
+        path.extend(args.iter().map(|s| (*s).to_owned()));
+        stmt::Expr::Func(stmt::ExprFunc::JsonExtract(stmt::FuncJsonExtract {
+            base: Box::new(stmt::Expr::record(fields)),
+            path,
+            ty,
+        }))
+    }
+
+    fn truthy(expr: stmt::Expr) -> stmt::Expr {
+        stmt::Expr::binary_op(
+            expr,
+            stmt::BinaryOp::Eq,
+            stmt::Expr::Static(stmt::Value::Bool(true)),
+        )
+    }
+
+    #[test]
+    fn fulltext_predicate_is_emitted_bare() {
+        let call = func(
+            "CONTAINS",
+            &["{base}", "{base:1}"],
+            vec![stmt::Expr::arg(0), stmt::Expr::arg(1)],
+            stmt::Type::Bool,
+        );
+        assert_eq!(render_predicate(&truthy(call)), "CONTAINS(@p1, @p2)");
+    }
+
+    #[test]
+    fn fulltext_language_is_space_separated() {
+        let call = func(
+            "CONTAINS",
+            &["{base}", "{base:1}", "%LANGUAGE", "{base:2}"],
+            vec![stmt::Expr::arg(0), stmt::Expr::arg(1), stmt::Expr::arg(2)],
+            stmt::Type::Bool,
+        );
+        assert_eq!(
+            render_predicate(&truthy(call)),
+            "CONTAINS(@p1, @p2, LANGUAGE @p3)"
+        );
+    }
+
+    #[test]
+    fn bit_returning_predicate_is_compared_to_one() {
+        let call = func(
+            "ISJSON",
+            &["{base}"],
+            vec![stmt::Expr::arg(0)],
+            stmt::Type::Bool,
+        );
+        assert_eq!(render_predicate(&truthy(call)), "ISJSON(@p1) = 1");
+    }
+
+    #[test]
+    fn method_renders_receiver_then_arguments() {
+        let call = method(
+            "STIntersects",
+            &["{base:1}"],
+            vec![stmt::Expr::arg(0), stmt::Expr::arg(1)],
+            stmt::Type::Bool,
+        );
+        assert_eq!(render_predicate(&truthy(call)), "@p1.STIntersects(@p2) = 1");
+    }
+
+    #[test]
+    fn keyword_argument_has_no_field_index() {
+        let call = func(
+            "ISJSON",
+            &["{base}", "ARRAY"],
+            vec![stmt::Expr::arg(0)],
+            stmt::Type::Bool,
+        );
+        assert_eq!(render_predicate(&truthy(call)), "ISJSON(@p1, ARRAY) = 1");
     }
 }

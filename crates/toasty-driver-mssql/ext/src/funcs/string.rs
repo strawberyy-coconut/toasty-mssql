@@ -1,11 +1,14 @@
 //! String functions — Microsoft's [String Functions][ref] category.
 //!
+//! Every argument that comes from the caller is bound, not inlined; see the
+//! [`funcs`](super) module.
+//!
 //! [ref]: https://learn.microsoft.com/en-us/sql/t-sql/functions/string-functions-transact-sql
 
-use toasty::stmt::{Expr, Path};
+use toasty::stmt::{Expr, IntoExpr, Path};
 use toasty_core::stmt;
 
-use super::{Operand, call, call_last, check, text};
+use super::{Operand, arg, call, call_last, check};
 
 /// String functions on a text column.
 ///
@@ -44,26 +47,26 @@ pub trait MssqlStr {
         call(&self.operand(), stmt::Type::I32, "DATALENGTH", vec![])
     }
 
-    /// `CHARINDEX(N'needle', col)` — 1-based position, or `0` when absent.
+    /// `CHARINDEX(needle, col)` — 1-based position, or `0` when absent.
     ///
     /// Note the argument order: the needle comes first in T-SQL.
-    fn char_index(&self, needle: &str) -> Expr<i32> {
+    fn char_index(&self, needle: impl IntoExpr<String>) -> Expr<i32> {
         call_last(
             &self.operand(),
             stmt::Type::I32,
             "CHARINDEX",
-            vec![text(needle)],
+            vec![arg(needle)],
         )
     }
 
-    /// `PATINDEX(N'pattern', col)` — like `CHARINDEX` but with `%` and `_`
+    /// `PATINDEX(pattern, col)` — like `CHARINDEX` but with `%` and `_`
     /// wildcards, and also taking the pattern first.
-    fn pat_index(&self, pattern: &str) -> Expr<i32> {
+    fn pat_index(&self, pattern: impl IntoExpr<String>) -> Expr<i32> {
         call_last(
             &self.operand(),
             stmt::Type::I32,
             "PATINDEX",
-            vec![text(pattern)],
+            vec![arg(pattern)],
         )
     }
 
@@ -86,14 +89,14 @@ pub trait MssqlStr {
         call(&self.operand(), stmt::Type::I32, "UNICODE", vec![])
     }
 
-    /// `DIFFERENCE(col, N'other')` — 0 to 4, how alike the two `SOUNDEX`
+    /// `DIFFERENCE(col, other)` — 0 to 4, how alike the two `SOUNDEX`
     /// values are.
-    fn difference(&self, other: &str) -> Expr<i32> {
+    fn difference(&self, other: impl IntoExpr<String>) -> Expr<i32> {
         call(
             &self.operand(),
             stmt::Type::I32,
             "DIFFERENCE",
-            vec![text(other)],
+            vec![arg(other)],
         )
     }
 
@@ -132,55 +135,45 @@ pub trait MssqlStr {
         call(&self.operand(), stmt::Type::String, "SOUNDEX", vec![])
     }
 
-    /// `REPLACE(col, N'from', N'to')`.
-    fn replace(&self, from: &str, to: &str) -> Expr<String> {
+    /// `REPLACE(col, from, to)`.
+    fn replace(&self, from: impl IntoExpr<String>, to: impl IntoExpr<String>) -> Expr<String> {
         call(
             &self.operand(),
             stmt::Type::String,
             "REPLACE",
-            vec![text(from), text(to)],
+            vec![arg(from), arg(to)],
         )
     }
 
     /// `SUBSTRING(col, start, length)` — 1-based `start`.
     ///
     /// T-SQL's `SUBSTRING` requires all three arguments.
-    fn substring(&self, start: i32, length: i32) -> Expr<String> {
+    fn substring(&self, start: impl IntoExpr<i32>, length: impl IntoExpr<i32>) -> Expr<String> {
         call(
             &self.operand(),
             stmt::Type::String,
             "SUBSTRING",
-            vec![start.to_string(), length.to_string()],
+            vec![arg(start), arg(length)],
         )
     }
 
     /// `LEFT(col, n)`.
-    fn left(&self, n: i32) -> Expr<String> {
-        call(
-            &self.operand(),
-            stmt::Type::String,
-            "LEFT",
-            vec![n.to_string()],
-        )
+    fn left(&self, n: impl IntoExpr<i32>) -> Expr<String> {
+        call(&self.operand(), stmt::Type::String, "LEFT", vec![arg(n)])
     }
 
     /// `RIGHT(col, n)`.
-    fn right(&self, n: i32) -> Expr<String> {
-        call(
-            &self.operand(),
-            stmt::Type::String,
-            "RIGHT",
-            vec![n.to_string()],
-        )
+    fn right(&self, n: impl IntoExpr<i32>) -> Expr<String> {
+        call(&self.operand(), stmt::Type::String, "RIGHT", vec![arg(n)])
     }
 
     /// `REPLICATE(col, n)`.
-    fn replicate(&self, n: i32) -> Expr<String> {
+    fn replicate(&self, n: impl IntoExpr<i32>) -> Expr<String> {
         call(
             &self.operand(),
             stmt::Type::String,
             "REPLICATE",
-            vec![n.to_string()],
+            vec![arg(n)],
         )
     }
 }

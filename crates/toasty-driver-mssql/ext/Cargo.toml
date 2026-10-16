@@ -37,13 +37,20 @@ datetimeoffset = ["toasty", "dep:jiff"]
 funcs-json = ["toasty"]
 funcs-string = ["toasty"]
 funcs-math = ["toasty"]
+funcs-fulltext = ["toasty"]
 # The one category that needs more from `toasty` than `dep:toasty`: the methods
 # are implemented for the `jiff` temporal types, which `toasty` re-exports only
 # under its own `jiff` feature.
 funcs-date = ["toasty", "toasty/jiff"]
 
 # All of them. Spatial methods are not included: they come with `spatial`.
-funcs = ["funcs-json", "funcs-string", "funcs-math", "funcs-date"]
+funcs = [
+    "funcs-json",
+    "funcs-string",
+    "funcs-math",
+    "funcs-date",
+    "funcs-fulltext",
+]
 
 [dependencies]
 geo-types = { version = "0.7", optional = true }
