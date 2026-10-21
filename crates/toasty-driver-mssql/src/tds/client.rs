@@ -164,26 +164,39 @@ impl Client {
         let _ = read_only;
 
         if self.transaction_depth == 0 {
-            let level = match isolation {
-                Some(IsolationLevel::ReadUncommitted) => TransactionIsolationLevel::ReadUncommitted,
-                None | Some(IsolationLevel::ReadCommitted) => {
-                    TransactionIsolationLevel::ReadCommitted
-                }
-                Some(IsolationLevel::RepeatableRead) => TransactionIsolationLevel::RepeatableRead,
-                Some(IsolationLevel::Serializable) => TransactionIsolationLevel::Serializable,
-            };
-
             self.client
-                .begin_transaction(level, None)
+                .begin_transaction(isolation_level(isolation), None)
                 .await
-                .map_err(classify)?;
+                .map_err(|error| {
+                    self.invalidate();
+                    classify(error)
+                })?;
         } else {
             // Nesting is emulated with a savepoint so an inner rollback only
-            // undoes the inner work.
-            self.client
+            // undoes the inner work. If the server says there is no transaction
+            // to save, the server has already ended it (a deadlock victim, for
+            // example) while this connection's depth still counts it. Trust the
+            // server, discard the stale depth, and start a fresh transaction.
+            if let Err(error) = self
+                .client
                 .save_transaction(savepoint_name(self.transaction_depth))
                 .await
-                .map_err(classify)?;
+            {
+                if sql_error_number(&error) == Some(SQL_NO_ACTIVE_TRANSACTION) {
+                    self.transaction_depth = 0;
+
+                    self.client
+                        .begin_transaction(isolation_level(isolation), None)
+                        .await
+                        .map_err(|error| {
+                            self.invalidate();
+                            classify(error)
+                        })?;
+                } else {
+                    self.invalidate();
+                    return Err(classify(error));
+                }
+            }
         }
 
         self.transaction_depth += 1;
@@ -197,11 +210,15 @@ impl Client {
             return Ok(());
         }
 
-        if self.transaction_depth == 1 {
-            self.client
-                .commit_transaction(None, None)
-                .await
-                .map_err(classify)?;
+        if self.transaction_depth == 1
+            && let Err(error) = self.client.commit_transaction(None, None).await
+        {
+            // The commit may have failed after the server ended the
+            // transaction, leaving the depth out of step with the session.
+            // Drop the depth and evict the connection rather than reuse it.
+            self.transaction_depth -= 1;
+            self.invalidate();
+            return Err(classify(error));
         }
 
         self.transaction_depth -= 1;
@@ -214,16 +231,21 @@ impl Client {
             return Ok(());
         }
 
-        if self.transaction_depth == 1 {
-            self.client
-                .rollback_transaction(None, None)
-                .await
-                .map_err(classify)?;
+        let result = if self.transaction_depth == 1 {
+            self.client.rollback_transaction(None, None).await
         } else {
             self.client
                 .rollback_transaction(Some(savepoint_name(self.transaction_depth - 1)), None)
                 .await
-                .map_err(classify)?;
+        };
+
+        if let Err(error) = result {
+            // A rollback can fail because the server already rolled the
+            // transaction back, as it does to a deadlock victim. The session
+            // may no longer match the depth, so drop a level and evict it.
+            self.transaction_depth -= 1;
+            self.invalidate();
+            return Err(classify(error));
         }
 
         self.transaction_depth -= 1;
@@ -235,7 +257,10 @@ impl Client {
         self.client
             .save_transaction(name.to_owned())
             .await
-            .map_err(classify)
+            .map_err(|error| {
+                self.invalidate();
+                classify(error)
+            })
     }
 
     /// Rolls back to a named savepoint, leaving the transaction open.
@@ -243,18 +268,51 @@ impl Client {
         self.client
             .rollback_transaction(Some(name.to_owned()), None)
             .await
-            .map_err(classify)
+            .map_err(|error| {
+                self.invalidate();
+                classify(error)
+            })
     }
 
     /// Whether the connection still looks alive.
     pub(crate) fn is_valid(&self) -> bool {
         !self.client.is_connection_dead()
     }
+
+    /// Marks the session unusable so the pool evicts it instead of reusing it.
+    fn invalidate(&mut self) {
+        self.client.mark_connection_dead();
+    }
+}
+
+/// The isolation level a SQL Server transaction starts with.
+fn isolation_level(isolation: Option<IsolationLevel>) -> TransactionIsolationLevel {
+    match isolation {
+        Some(IsolationLevel::ReadUncommitted) => TransactionIsolationLevel::ReadUncommitted,
+        None | Some(IsolationLevel::ReadCommitted) => TransactionIsolationLevel::ReadCommitted,
+        Some(IsolationLevel::RepeatableRead) => TransactionIsolationLevel::RepeatableRead,
+        Some(IsolationLevel::Serializable) => TransactionIsolationLevel::Serializable,
+    }
 }
 
 /// The savepoint name used for the given nesting depth.
 fn savepoint_name(depth: usize) -> String {
     format!("toasty_sp_{depth}")
+}
+
+/// SQL Server's "no active transaction" error, raised when `SAVE TRANSACTION`
+/// runs on a session that has none.
+const SQL_NO_ACTIVE_TRANSACTION: i64 = 628;
+
+/// The first SQL Server error number in `error`, if the server reported one.
+fn sql_error_number(error: &TdsError) -> Option<i64> {
+    match error {
+        TdsError::SqlServerError { diagnostics } => diagnostics
+            .errors
+            .first()
+            .map(|error| i64::from(error.number)),
+        _ => None,
+    }
 }
 
 /// Maps a TDS error onto Toasty's error taxonomy.
@@ -409,5 +467,56 @@ mod tests {
             )
             .await
             .expect("DROP must succeed");
+    }
+
+    /// A rollback the server rejects because it already ended the transaction
+    /// (what happens to a deadlock victim) must not leave the depth stuck.
+    #[tokio::test]
+    async fn failed_rollback_resets_depth_and_invalidates() {
+        let mut client = connect(&context()).await;
+
+        client.begin(None, false).await.expect("begin must succeed");
+
+        // End the transaction behind the driver's back, leaving its depth at 1.
+        client
+            .exec("ROLLBACK TRANSACTION".to_owned(), Vec::new(), false)
+            .await
+            .expect("the raw rollback must succeed");
+
+        let error = client
+            .rollback()
+            .await
+            .expect_err("the rollback must fail because the transaction is gone");
+
+        assert!(error.is_driver_operation_failed());
+        assert_eq!(client.transaction_depth, 0);
+        assert!(!client.is_valid(), "the pool must evict the connection");
+    }
+
+    /// A savepoint attempted on a session whose transaction is already gone
+    /// recovers by starting a fresh transaction instead of returning error 628.
+    #[tokio::test]
+    async fn begin_recovers_when_the_transaction_is_already_gone() {
+        let mut client = connect(&context()).await;
+
+        client.begin(None, false).await.expect("begin must succeed");
+
+        client
+            .exec("ROLLBACK TRANSACTION".to_owned(), Vec::new(), false)
+            .await
+            .expect("the raw rollback must succeed");
+
+        // The depth still says a transaction is open, so this takes the
+        // savepoint branch and gets error 628 from the server.
+        client
+            .begin(None, false)
+            .await
+            .expect("begin must recover from the stale depth");
+
+        assert_eq!(client.transaction_depth, 1);
+        assert!(client.is_valid(), "the retried session must stay usable");
+
+        client.commit().await.expect("commit must succeed");
+        assert_eq!(client.transaction_depth, 0);
     }
 }
